@@ -1,4 +1,4 @@
-# gnina-vs
+# Gnina-VS: Automated Virtual Screening Pipeline
 
 A modular virtual-screening pipeline: **protein preparation** (with automatic RCSB PDB fetching), **ligand preparation**, **three-tier active-site detection**, **parallel Gnina docking**, and **results reporting**, packaged as a clean, installable Python CLI (`gnina-vs`).
 
