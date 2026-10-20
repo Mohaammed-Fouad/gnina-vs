@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gnina-vs"
-version = "1.0.0"
-description = "A modular virtual-screening pipeline built around Gnina: protein prep, ligand prep, active-site detection, parallel docking, and results reporting."
+version = "1.1.0"
+description = "A modular virtual-screening pipeline built around Gnina: protein prep, ligand prep, active-site detection, parallel docking, results reporting, and an optional metabolite-aware docking mode (BioTransformer + comparison + annotation + figures)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -29,12 +29,21 @@ dependencies = [
     "pandas>=1.5",
     "openpyxl>=3.0",
     "tqdm>=4.60",
-    "scipy>=1.9",
     "numpy>=1.23",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+# 'gnina-vs metabolite-run' needs its config parsed and (optionally) its
+# ligands protonated for pH 7.4; BioTransformer itself is a separate Java
+# jar (https://bitbucket.org/wishartlab/biotransformer3.0/), not pip-installable.
+metabolism = ["pyyaml>=6.0", "dimorphite-dl>=1.2.4"]
+# Optional ADMET-AI predictions (Phase 6 annotations); skipped gracefully,
+# with admet_status/admet_applicability_flag columns saying so, if absent.
+# Not verified against a real install in this environment.
+annotate = ["admet-ai"]
+# Phase 7 figures (metabolic tree, bar chart, heatmap, MW scatter).
+figures = ["matplotlib>=3.5"]
 
 [project.scripts]
 gnina-vs = "gnina_vs.cli:main"

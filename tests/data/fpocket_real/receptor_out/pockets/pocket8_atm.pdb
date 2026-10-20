@@ -1,0 +1,35 @@
+HEADER
+HEADER This is a pdb format file writen by the programm fpocket.                 
+HEADER It represents the atoms contacted by the voronoi vertices of the pocket.  
+HEADER                                                                           
+HEADER Information about the pocket     8:
+HEADER 0  - Pocket Score                      : -0.0440
+HEADER 1  - Drug Score                        : 0.0023
+HEADER 2  - Number of alpha spheres           :    15
+HEADER 3  - Mean alpha-sphere radius          : 4.1324
+HEADER 4  - Mean alpha-sphere Solvent Acc.    : 0.5147
+HEADER 5  - Mean B-factor of pocket residues  : 0.1536
+HEADER 6  - Hydrophobicity Score              : 58.7500
+HEADER 7  - Polarity Score                    :     4
+HEADER 8  - Amino Acid based volume Score     : 5.0000
+HEADER 9  - Pocket volume (Monte Carlo)       : 221.2343
+HEADER 10 - Pocket volume (convex hull)       : 1.9633
+HEADER 11 - Charge Score                      :     1
+HEADER 12 - Local hydrophobic density Score   : 7.0000
+HEADER 13 - Number of apolar alpha sphere     :     8
+HEADER 14 - Proportion of apolar alpha sphere : 0.5333
+ATOM    332   CB LEU A 189      15.935  32.864  22.153  0.00  0.00           C 0
+ATOM    285    C TRP A 184      14.495  27.713  18.072  0.00  0.00           C 0
+ATOM    159   CZ PHE A 168      19.186  32.747  19.985  0.00  0.00           C 0
+ATOM    334  CD1 LEU A 189      16.327  31.647  24.304  0.00  0.00           C 0
+ATOM    326  OG1 THR A 188      13.202  30.210  20.469  0.00  0.00           O 0
+ATOM    157  CE1 PHE A 168      20.130  32.254  19.094  0.00  0.00           C 0
+ATOM    305    N THR A 186      16.438  29.964  16.716  0.68  1.09           N 0
+ATOM    194  CD1 LEU A 172      21.787  27.515  20.682  0.00  0.00           C 0
+ATOM    195  CD2 LEU A 172      21.910  28.464  18.375  0.00  0.00           C 0
+ATOM    262    O VAL A 181      17.491  25.467  18.352  0.58  3.21           O 0
+ATOM    269    O LYS A 182      17.905  27.680  15.830  0.61  1.07           O 0
+ATOM    264  CG1 VAL A 181      18.932  23.733  20.530  0.00  0.00           C 0
+ATOM    287   CB TRP A 184      13.904  25.342  18.545  0.00  0.00           C 0
+TER
+END

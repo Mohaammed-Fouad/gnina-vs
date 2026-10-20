@@ -1,0 +1,58 @@
+# Example config for `gnina-vs metabolite-run --config metabolite_run_config.yaml`.
+# This mirrors the terfenadine (parent) vs fexofenadine (metabolite) vs hERG
+# antitarget example from the project brief. Replace the PDB IDs, ligand
+# residue names, and BioTransformer jar path with your own before running.
+
+outdir: results/terfenadine_herg
+seed: 42
+
+# Hydrogen addition during protein preparation (see gnina_vs.protein).
+protein:
+  add_hydrogens: true
+  ph: 7.4
+
+# Metabolite generation (Phase 1). Leave biotransformer_jar unset (or omit
+# this whole section) to dock only the parent, or use metabolites_csv to
+# supply curated literature metabolites instead of / alongside BioTransformer
+# -- see examples/curated_metabolites.csv for the expected format.
+metabolism:
+  biotransformer_jar: /path/to/biotransformer3.0.jar
+  type: allHuman        # allHuman | cyp450 | phaseII | hgut | envmicro
+  steps: 1               # 1 or 2 (capped)
+  include_gut: false
+  # metabolites_csv: examples/curated_metabolites.csv
+
+docking:
+  cnn_scoring: rescore    # none | rescore | refinement | metrorescore | metrorefine | all
+  exhaustiveness: 16
+  num_modes: 9
+  workers: 4
+  cpu_per_worker: 2
+  box_size: 25.0
+  gnina_exec: gnina
+  timeout: 300
+
+targets:
+  - id: hERG
+    role: antitarget
+    pdb: 5VA2                     # bare PDB ID -> auto-fetched from RCSB
+    center_from_ligand: true      # box centered on the named co-crystal ligand
+    ligand_resname: 3JW           # exact HETATM residue name in 5VA2
+    keep_hetatm: []
+    reference_ligands:
+      - name: terfenadine
+        smiles: "CC(C)(C)c1ccc(cc1)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1"
+
+  - id: MOR
+    role: therapeutic
+    pdb: 5C1M
+    center_from_ligand: true
+    ligand_resname: 65B
+    reference_ligands:
+      - name: morphine
+        smiles: "CN1CCC23C4Oc5c2c(CC1C3C=CC4O)ccc5O"
+
+drugs:
+  - id: terfenadine
+    smiles: "CC(C)(C)c1ccc(cc1)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1"
+    targets: [hERG]

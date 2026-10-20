@@ -1,0 +1,32 @@
+# Companion to examples/compounds.csv -- demonstrates loading parent
+# compounds from a spreadsheet (drugs_file) instead of writing them
+# inline under 'drugs:'. See the README's "Quick Start: Dock an Excel
+# Sheet of Compounds With Their Metabolites" for the full walkthrough.
+
+outdir: results/from_excel
+seed: 42
+
+drugs_file: examples/compounds.csv   # or .xlsx; columns default to ID/Name/SMILES
+
+# Omit this section entirely to dock only the compounds as given (no
+# predicted metabolites). metabolites_csv below is a stand-in for a real
+# BioTransformer jar so this config runs without Java installed.
+#
+# IMPORTANT for multi-drug configs like this one: the CSV has a parent_id
+# column (matching each drug's 'id' above) so its one curated metabolite
+# (fexofenadine) only gets attached to CPD001, not to every drug in the
+# run. Without that column, EVERY row would be attached to EVERY drug --
+# see metabolism.metabolites_csv_has_parent_column() / the README.
+metabolism:
+  metabolites_csv: examples/curated_metabolites_multi_drug.csv
+
+docking:
+  cnn_scoring: rescore
+  exhaustiveness: 8
+  workers: 4
+
+targets:
+  - id: hERG
+    pdb: 5VA2
+    center_from_ligand: true
+    ligand_resname: 3JW

@@ -1,0 +1,42 @@
+HEADER
+HEADER This is a pdb format file writen by the programm fpocket.                 
+HEADER It represents the atoms contacted by the voronoi vertices of the pocket.  
+HEADER                                                                           
+HEADER Information about the pocket     6:
+HEADER 0  - Pocket Score                      : 0.0139
+HEADER 1  - Drug Score                        : 0.1708
+HEADER 2  - Number of alpha spheres           :    27
+HEADER 3  - Mean alpha-sphere radius          : 3.8430
+HEADER 4  - Mean alpha-sphere Solvent Acc.    : 0.5276
+HEADER 5  - Mean B-factor of pocket residues  : 0.1915
+HEADER 6  - Hydrophobicity Score              : 36.5000
+HEADER 7  - Polarity Score                    :     4
+HEADER 8  - Amino Acid based volume Score     : 4.2500
+HEADER 9  - Pocket volume (Monte Carlo)       : 219.1123
+HEADER 10 - Pocket volume (convex hull)       : 8.0262
+HEADER 11 - Charge Score                      :    -2
+HEADER 12 - Local hydrophobic density Score   : 18.0000
+HEADER 13 - Number of apolar alpha sphere     :    19
+HEADER 14 - Proportion of apolar alpha sphere : 0.7037
+ATOM    185   CB THR A 171      25.475  32.075  23.876  0.00  0.00           C 0
+ATOM    187  CG2 THR A 171      24.741  31.417  25.045  0.00  0.00           C 0
+ATOM    156  CD2 PHE A 168      20.586  34.664  20.397  0.00  0.00           C 0
+ATOM    152    O PHE A 168      24.305  32.327  20.552  0.56  1.07           O 0
+ATOM    158  CE2 PHE A 168      19.415  33.954  20.639  0.00  0.00           C 0
+ATOM    159   CZ PHE A 168      19.186  32.747  19.985  0.00  0.00           C 0
+ATOM    334  CD1 LEU A 189      16.327  31.647  24.304  0.00  0.00           C 0
+ATOM    194  CD1 LEU A 172      21.787  27.515  20.682  0.00  0.00           C 0
+ATOM    184    O THR A 171      25.827  28.840  23.676  0.00  0.00           O 0
+ATOM    217   CG GLU A 175      24.354  25.596  25.435  0.00  0.00           C 0
+ATOM    189   CA LEU A 172      24.587  28.528  21.224  0.00  0.00           C 0
+ATOM    188    N LEU A 172      25.264  29.727  21.687  0.00  0.00           N 0
+ATOM    192   CB LEU A 172      23.789  28.840  19.955  0.00  0.00           C 0
+ATOM     20    O ILE A 153      20.214  37.743  23.876  0.25  1.07           O 0
+ATOM     21   CB ILE A 153      23.062  36.854  23.441  0.00  0.00           C 0
+ATOM    157  CE1 PHE A 168      20.130  32.254  19.094  0.00  0.00           C 0
+ATOM     90    N ASP A 152      21.554  34.953  27.691  0.00  0.00           N 0
+ATOM     22  CG1 ILE A 153      24.282  36.029  23.879  0.00  0.00           C 0
+ATOM     17    N ILE A 153      22.322  36.838  25.818  0.37  1.09           N 0
+ATOM    367  ND2 ASN A 193      17.619  36.681  24.378  0.64  5.47           N 0
+TER
+END

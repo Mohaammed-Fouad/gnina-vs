@@ -8,13 +8,23 @@ Priority order
 1. **Manual coordinates** (``--center-x/y/z``) -- highest priority, always
    wins if given.
 2. **Manual residue selection** (``--active-site-residues``) -- centroid of
-   named catalytic residues (e.g. ``"TYR120,GLU150"``).
-3. **Tier 1** -- co-crystallised ligand centroid (searches the *raw*,
-   un-stripped PDB, since protein preparation removes HETATM records).
-4. **Tier 2** -- ``fpocket`` geometric pocket finder (requires fpocket on
+   named catalytic residues (e.g. ``"TYR120,GLU150"`` or, in a multi-chain
+   structure, ``"A:TYR120,B:GLU150"``).
+3. **Explicit ligand** (``--ligand-resname``, optional ``--ligand-chain``)
+   -- centroid of a named co-crystallised ligand/cofactor, selected exactly
+   rather than guessed.
+4. **Tier 1** -- co-crystallised ligand centroid, auto-selected as the
+   largest non-excluded HETATM residue (searches the *raw*, un-stripped
+   PDB, since protein preparation removes HETATM records).
+5. **Tier 2** -- ``fpocket`` geometric pocket finder (requires fpocket on
    PATH).
-5. **Tier 3** -- built-in grid-based cavity detector (pure Python + NumPy,
-   with an optional scipy-accelerated dilation step).
+
+There is no automatic geometric fallback beyond Tier 2: a grid-based cavity
+detector cannot reliably distinguish a real pocket from the probe-radius
+shell around the whole protein surface (it tends to just return the
+protein's centre), so if Tier 1 and Tier 2 both fail, detection stops and
+raises a clear error asking for explicit coordinates, residues, or a named
+ligand -- it never silently guesses.
 
 Whichever method wins, a ``.pml`` PyMOL script is written so the detected
 box can be visually inspected before committing CPU hours to docking.
@@ -23,27 +33,21 @@ box can be visually inspected before committing CPU hours to docking.
 from __future__ import annotations
 
 import logging
-import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-from collections import defaultdict, deque
+from collections import defaultdict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-try:
-    import numpy as np
-    _NUMPY_AVAILABLE = True
-except ImportError:
-    _NUMPY_AVAILABLE = False
-
 # Residues that are never the docking target: water, crystallization
-# additives/cryo-protectants, common ions, AND (new) common enzyme
-# cofactors, which Tier 1 would otherwise mistake for a bound drug-like
-# ligand.
+# additives/cryo-protectants, common ions, common enzyme cofactors (which
+# Tier 1 would otherwise mistake for a bound drug-like ligand), and
+# in-chain modified residues (selenomethionine, phosphorylated residues --
+# these are part of the polypeptide, not a ligand candidate).
 _SOLVENT_RESIDUES = {
     # water
     "HOH", "WAT", "DOD", "H2O",
@@ -60,41 +64,40 @@ _SOLVENT_RESIDUES = {
     # co-crystallised but are not the compound you want to dock against
     "ATP", "ADP", "AMP", "GTP", "GDP",
     "NAD", "NADP", "FAD", "FMN", "HEM", "PLP",
+    # in-chain modified residues (see gnina_vs.protein): part of the
+    # polypeptide, never a ligand candidate
+    "MSE", "SEP", "TPO", "PTR",
+    # N-/O-linked glycosylation sugars -- extremely common on secreted and
+    # membrane glycoproteins (e.g. COX-2/1CX2 carries several NAG residues
+    # at its N-glycosylation sites). These are structural carbohydrate
+    # decorations, never the ligand of interest, but were previously
+    # missing from this list -- a single NAG (~15 heavy atoms) could win
+    # Tier 1's "most heavy atoms" heuristic over a smaller real ligand.
+    "NAG", "NDG", "BMA", "MAN", "GAL", "GLA", "FUC", "FUL",
+    "BGC", "GLC", "SIA", "ANE", "NGA", "XYS", "XYP", "A2G",
 }
 
-_VDW = {
-    "C": 1.70, "N": 1.55, "O": 1.52, "S": 1.80, "P": 1.80,
-    "F": 1.47, "CL": 1.75, "BR": 1.85, "I": 1.98,
-    "ZN": 1.22, "FE": 1.26, "MG": 1.73, "CA": 1.97,
-}
-_VDW_DEFAULT = 1.70
-
-# Minimum cavity-cluster size (voxels) below which a cluster is discarded.
-# At 1 A resolution, 50 voxels ~= 50 A^3 -- too small to dock a drug-like molecule.
-MIN_CLUSTER_VOXELS = 50
-
-_RESIDUE_SPEC_RE = re.compile(r"^([A-Za-z]{3})\s*(-?\d+)$")
+_RESIDUE_SPEC_RE = re.compile(
+    r"^(?:(?P<chain>[A-Za-z0-9]):)?(?P<name>[A-Za-z]{3})\s*(?P<num>-?\d+)$"
+)
 
 
-def _parse_protein_atoms(pdb_path: str) -> list[tuple[float, float, float, float]]:
-    """Return [(x, y, z, vdw_radius), ...] for all ATOM records."""
-    atoms = []
-    with open(pdb_path) as fh:
-        for line in fh:
-            if not line.startswith("ATOM"):
-                continue
-            try:
-                x = float(line[30:38])
-                y = float(line[38:46])
-                z = float(line[46:54])
-            except ValueError:
-                continue
-            element = line[76:78].strip().upper() if len(line) > 76 else ""
-            if not element:
-                element = line[12:16].strip().lstrip("0123456789").upper()[:2]
-            r = _VDW.get(element, _VDW_DEFAULT)
-            atoms.append((x, y, z, r))
-    return atoms
+def _is_hydrogen_line(line: str) -> bool:
+    """True if an ATOM/HETATM line is a hydrogen, using the element column
+    (cols 77-78) when filled, falling back to the atom name for older PDB
+    files that leave it blank. Needed because Tier 1's "most heavy atoms"
+    heuristic must actually count heavy atoms: some depositions carry
+    explicit hydrogens on HETATM groups (sometimes added by later
+    reprocessing even for a structure solved at a resolution where
+    hydrogens were never experimentally observable), and a residue with
+    many exchangeable hydrogens (e.g. a sugar's hydroxyls) can otherwise
+    inflate its atom count enough to tie or beat a real ligand's.
+    """
+    element = line[76:78].strip().upper() if len(line) >= 78 else ""
+    if element:
+        return element == "H"
+    name = line[12:16].strip().lstrip("0123456789")
+    return name.upper().startswith("H")
 
 
 def _centroid(coords: list[tuple]) -> tuple[float, float, float]:
@@ -104,12 +107,36 @@ def _centroid(coords: list[tuple]) -> tuple[float, float, float]:
             sum(c[2] for c in coords) / n)
 
 
+def _pocket_centroid_from_file(path: Path) -> tuple[float, float, float] | None:
+    """Centroid of every ATOM/HETATM coordinate in a small PDB/PQR file
+    (a single fpocket pocket's vertices or contact atoms)."""
+    pts = []
+    with open(path) as fh:
+        for line in fh:
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            try:
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+            except ValueError:
+                continue
+            pts.append((x, y, z))
+    return _centroid(pts) if pts else None
+
+
 # --------------------------------------------------------------------------- #
 # Manual overrides
 # --------------------------------------------------------------------------- #
-def parse_residue_spec(spec: str) -> list[tuple[str, int]]:
-    """Parse a comma-separated residue spec like ``"TYR120,GLU150"`` into
-    ``[("TYR", 120), ("GLU", 150)]``."""
+def parse_residue_spec(spec: str) -> list[tuple[str | None, str, int]]:
+    """Parse a comma-separated residue spec into ``[(chain_or_None, name,
+    number), ...]``.
+
+    Accepts ``"TYR120,GLU150"`` (chain-agnostic; only safe when the residue
+    number is unique across chains) or ``"A:TYR120,B:GLU150"`` (chain
+    explicit, required whenever the same residue number appears in more
+    than one chain).
+    """
     residues = []
     for token in spec.split(","):
         token = token.strip()
@@ -119,69 +146,182 @@ def parse_residue_spec(spec: str) -> list[tuple[str, int]]:
         if not m:
             raise ValueError(
                 f"Could not parse residue spec '{token}' in "
-                f"--active-site-residues. Expected format like 'TYR120' "
-                f"(3-letter residue name + residue number)."
+                f"--active-site-residues. Expected format like 'TYR120' or "
+                f"'A:TYR120' (optional chain + 3-letter residue name + "
+                f"residue number)."
             )
-        residues.append((m.group(1).upper(), int(m.group(2))))
+        residues.append((m.group("chain"), m.group("name").upper(), int(m.group("num"))))
     if not residues:
         raise ValueError("--active-site-residues was given but no residues could be parsed.")
     return residues
 
 
 def centroid_from_residues(
-    pdb_path: str, residues: list[tuple[str, int]],
+    pdb_path: str, residues: list[tuple[str | None, str, int]],
 ) -> tuple[float, float, float]:
     """Compute the centroid of a set of named residues (e.g. key catalytic
-    residues), using every atom of each matching residue."""
-    wanted = set(residues)
-    found = set()
-    coords = []
+    residues), using every heavy atom of each matching residue (hydrogens,
+    when present, are excluded -- see `_is_hydrogen_line`, since including
+    them would skew the centroid toward wherever peripheral/exchangeable
+    hydrogens happen to be modeled, inconsistently between files that do
+    and don't carry explicit hydrogens).
+
+    A residue given without a chain (``(None, "TYR", 120)``) is resolved
+    automatically if that (name, number) combination is unique across the
+    structure's chains; if it matches more than one chain, this raises
+    `ValueError` naming the candidates rather than silently averaging
+    across chains that may belong to different subunits/active sites.
+    """
+    # First pass: which chain(s) does each (name, number) appear in, and
+    # collect coordinates keyed by the fully-resolved (chain, name, number).
+    chains_seen: dict[tuple[str, int], set[str]] = defaultdict(set)
+    coords_by_key: dict[tuple[str, str, int], list[tuple[float, float, float]]] = defaultdict(list)
 
     with open(pdb_path) as fh:
         for line in fh:
             if not line.startswith(("ATOM", "HETATM")):
+                continue
+            if _is_hydrogen_line(line):
                 continue
             res_name = line[17:20].strip().upper()
             try:
                 res_seq = int(line[22:26])
             except ValueError:
                 continue
-            key = (res_name, res_seq)
-            if key not in wanted:
-                continue
+            chain = line[21]
             try:
                 x = float(line[30:38])
                 y = float(line[38:46])
                 z = float(line[46:54])
             except ValueError:
                 continue
-            coords.append((x, y, z))
-            found.add(key)
+            chains_seen[(res_name, res_seq)].add(chain)
+            coords_by_key[(chain, res_name, res_seq)].append((x, y, z))
 
-    missing = wanted - found
+    resolved: list[tuple[str | None, str, int]] = []
+    for chain, name, num in residues:
+        if chain is None:
+            candidates = chains_seen.get((name, num), set())
+            if len(candidates) > 1:
+                options = ", ".join(f"{c}:{name}{num}" for c in sorted(candidates))
+                raise ValueError(
+                    f"Residue {name}{num} is ambiguous: it appears in "
+                    f"multiple chains ({', '.join(sorted(candidates))}). "
+                    f"Specify the chain explicitly, e.g. '{options.split(', ')[0]}'."
+                )
+            chain = next(iter(candidates)) if candidates else None
+        resolved.append((chain, name, num))
+
+    wanted = {(c, n, s) for c, n, s in resolved if c is not None}
+    found = set()
+    coords = []
+    for chain, name, num in resolved:
+        if chain is None:
+            continue
+        pts = coords_by_key.get((chain, name, num))
+        if pts:
+            coords.extend(pts)
+            found.add((chain, name, num))
+
+    missing = wanted | {(c, n, s) for c, n, s in resolved if c is None}
+    missing = missing - found
     if missing:
         logger.warning(
             "  [Manual] Residue(s) not found in PDB and ignored: %s",
-            ", ".join(f"{name}{num}" for name, num in sorted(missing)),
+            ", ".join(f"{(c + ':') if c else ''}{n}{s}" for c, n, s in sorted(missing, key=str)),
         )
     if not coords:
         raise ValueError(
             "None of the residues in --active-site-residues were found in "
-            "the PDB file. Double-check residue names/numbers against the "
-            "structure."
+            "the PDB file. Double-check residue names/numbers (and chain, "
+            "if given) against the structure."
         )
 
     cx, cy, cz = _centroid(coords)
     logger.info(
         "  [Manual] Centroid of %d/%d requested residues (%d atoms) -> "
         "centre (%.3f, %.3f, %.3f)",
-        len(found), len(wanted), len(coords), cx, cy, cz,
+        len(found), len(resolved), len(coords), cx, cy, cz,
     )
     return cx, cy, cz
 
 
 # --------------------------------------------------------------------------- #
-# Tier 1 -- co-crystallised ligand
+# Explicit ligand selection
+# --------------------------------------------------------------------------- #
+def select_ligand_by_name(
+    pdb_path: str, resname: str, chain: str | None = None,
+) -> tuple[float, float, float]:
+    """Centroid of one specific, exactly-named HETATM residue (e.g. a
+    catalytic cofactor such as ATP/NAD that Tier 1's auto-selection would
+    otherwise skip, or a specific chain's copy of a repeated ligand).
+
+    Every distinct HETATM residue with this name is logged (with its chain,
+    residue number and heavy-atom count -- hydrogens, when present, are
+    excluded from both the count and the centroid; see `_is_hydrogen_line`)
+    so an ambiguous choice is visible. If ``chain`` is not given and more
+    than one distinct residue (different chain and/or residue number)
+    matches ``resname``, this raises `ValueError` listing the candidates
+    instead of guessing or averaging across them.
+    """
+    resname = resname.strip().upper()
+    instances: dict[tuple[str, str], list[tuple[float, float, float]]] = defaultdict(list)
+
+    with open(pdb_path) as fh:
+        for line in fh:
+            if not line.startswith("HETATM"):
+                continue
+            if line[17:20].strip().upper() != resname:
+                continue
+            if _is_hydrogen_line(line):
+                continue
+            res_chain = line[21]
+            res_seq = line[22:26].strip()
+            try:
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+            except ValueError:
+                continue
+            instances[(res_chain, res_seq)].append((x, y, z))
+
+    if not instances:
+        raise ValueError(
+            f"No HETATM residue named '{resname}' found in '{pdb_path}'. "
+            f"Check the residue name (and that this structure isn't apo)."
+        )
+
+    for (c, s), pts in sorted(instances.items()):
+        logger.info("  [Explicit ligand] %s %s/%s: %d heavy atoms", resname, c, s, len(pts))
+
+    if chain is not None:
+        matches = {k: v for k, v in instances.items() if k[0] == chain}
+        if not matches:
+            raise ValueError(
+                f"No HETATM residue named '{resname}' found in chain '{chain}' "
+                f"of '{pdb_path}'. Found it in chain(s): "
+                f"{', '.join(sorted({c for c, _ in instances}))}."
+            )
+        instances = matches
+
+    if len(instances) > 1:
+        options = ", ".join(f"{c}:{resname}{s}" for c, s in sorted(instances))
+        raise ValueError(
+            f"Residue name '{resname}' is ambiguous: {len(instances)} distinct "
+            f"copies found ({options}). Specify --ligand-chain to pick one."
+        )
+
+    (c, s), pts = next(iter(instances.items()))
+    cx, cy, cz = _centroid(pts)
+    logger.info(
+        "  [Explicit ligand] Selected %s %s/%s (%d heavy atoms) -> centre (%.3f, %.3f, %.3f)",
+        resname, c, s, len(pts), cx, cy, cz,
+    )
+    return cx, cy, cz
+
+
+# --------------------------------------------------------------------------- #
+# Tier 1 -- co-crystallised ligand (auto-selected)
 # --------------------------------------------------------------------------- #
 def _tier1_cocrystal(pdb_path: str) -> tuple[float, float, float] | None:
     """Return centroid of the largest co-crystallised ligand, or None."""
@@ -193,6 +333,8 @@ def _tier1_cocrystal(pdb_path: str) -> tuple[float, float, float] | None:
                 continue
             res_name = line[17:20].strip().upper()
             if res_name in _SOLVENT_RESIDUES:
+                continue
+            if _is_hydrogen_line(line):
                 continue
             try:
                 x = float(line[30:38])
@@ -213,6 +355,15 @@ def _tier1_cocrystal(pdb_path: str) -> tuple[float, float, float] | None:
     for key, pts in sorted(residue_coords.items()):
         logger.info("  [Tier 1] HETATM residue found: %s (%d heavy atoms)", key, len(pts))
 
+    if len(residue_coords) > 1:
+        logger.warning(
+            "  [Tier 1] %d candidate HETATM residues found (%s); automatic "
+            "selection is ambiguous -- picking the one with the most heavy "
+            "atoms. Verify the choice below, or use --ligand-resname / "
+            "--ligand-chain to select explicitly if it's wrong.",
+            len(residue_coords), ", ".join(sorted(residue_coords)),
+        )
+
     # Use the residue with the most heavy atoms (= most likely the bound ligand)
     best_key = max(residue_coords, key=lambda k: len(residue_coords[k]))
     best_pts = residue_coords[best_key]
@@ -228,7 +379,17 @@ def _tier1_cocrystal(pdb_path: str) -> tuple[float, float, float] | None:
 # Tier 2 -- fpocket
 # --------------------------------------------------------------------------- #
 def _tier2_fpocket(pdb_path: str) -> tuple[float, float, float] | None:
-    """Run fpocket and return the centroid of the top-ranked pocket, or None."""
+    """Run fpocket and return the centroid of the top-ranked pocket, or None.
+
+    fpocket ranks pockets by druggability score and names them ``pocket1``,
+    ``pocket2``, ... in that order, writing (per pocket) a
+    ``pockets/pocketN_vert.pqr`` (Voronoi vertices defining the cavity) and
+    a ``pockets/pocketN_atm.pdb`` (protein atoms lining it). Neither
+    ``<stem>_info.txt`` nor the ``.pml``/``.tcl`` visualisation scripts
+    contain a machine-readable centroid, so the centroid is computed
+    directly from ``pocket1_vert.pqr`` (falling back to ``pocket1_atm.pdb``
+    if the vertex file is missing).
+    """
     if shutil.which("fpocket") is None:
         logger.debug("  [Tier 2] fpocket not found on PATH -- skipping.")
         return None
@@ -250,245 +411,37 @@ def _tier2_fpocket(pdb_path: str) -> tuple[float, float, float] | None:
             logger.warning("  [Tier 2] fpocket exited with code %d.", proc.returncode)
             return None
 
-        stem = Path(tmp_pdb).stem
-        info_file = Path(tmpdir) / f"{stem}_out" / f"{stem}_info.txt"
-
-        if not info_file.exists():
-            logger.warning("  [Tier 2] fpocket info file not found.")
+        pockets_dir = Path(tmpdir) / "receptor_out" / "pockets"
+        if not pockets_dir.exists():
+            logger.warning("  [Tier 2] fpocket output directory not found: '%s'.", pockets_dir)
             return None
 
-        cx = cy = cz = None
-        in_pocket1 = False
-        with open(info_file) as fh:
-            for line in fh:
-                if re.match(r"Pocket\s+1\s*:", line):
-                    in_pocket1 = True
-                elif re.match(r"Pocket\s+[2-9]", line):
-                    break
-                if in_pocket1:
-                    m = re.search(r"x_centroid\s*:\s*([-\d.]+)", line)
-                    if m:
-                        cx = float(m.group(1))
-                    m = re.search(r"y_centroid\s*:\s*([-\d.]+)", line)
-                    if m:
-                        cy = float(m.group(1))
-                    m = re.search(r"z_centroid\s*:\s*([-\d.]+)", line)
-                    if m:
-                        cz = float(m.group(1))
+        vert_file = pockets_dir / "pocket1_vert.pqr"
+        atm_file = pockets_dir / "pocket1_atm.pdb"
 
-        if None in (cx, cy, cz):
-            logger.warning("  [Tier 2] Could not parse fpocket centroid.")
-            return None
+        centroid = None
+        source = None
+        if vert_file.exists():
+            centroid = _pocket_centroid_from_file(vert_file)
+            source = vert_file.name
+        if centroid is None and atm_file.exists():
+            centroid = _pocket_centroid_from_file(atm_file)
+            source = atm_file.name
 
-        logger.info("  [Tier 2] fpocket top pocket -> centre (%.3f, %.3f, %.3f)", cx, cy, cz)
-        return cx, cy, cz
-
-
-# --------------------------------------------------------------------------- #
-# Tier 3 -- grid-based cavity detector
-# --------------------------------------------------------------------------- #
-def _manual_dilate_3d(grid: "np.ndarray", radius_voxels: int) -> "np.ndarray":
-    """Simple 3-D spherical dilation using nested loops over a (2r+1)^3
-    kernel. Used as a scipy-free fallback for probe-radius expansion."""
-    result = grid.copy()
-    r = radius_voxels
-    offsets = []
-    for dx in range(-r, r + 1):
-        for dy in range(-r, r + 1):
-            for dz in range(-r, r + 1):
-                if dx * dx + dy * dy + dz * dz <= r * r:
-                    offsets.append((dx, dy, dz))
-
-    shape = grid.shape
-    xs, ys, zs = np.where(grid)
-    for x, y, z in zip(xs, ys, zs):
-        for dx, dy, dz in offsets:
-            nx, ny, nz = x + dx, y + dy, z + dz
-            if 0 <= nx < shape[0] and 0 <= ny < shape[1] and 0 <= nz < shape[2]:
-                result[nx, ny, nz] = True
-    return result
-
-
-def _tier3_grid(
-    pdb_path: str,
-    resolution: float = 1.0,
-    probe_radius: float = 1.4,
-) -> tuple[float, float, float] | None:
-    """Geometric cavity detection via a 3-D occupancy grid and exterior flood-fill."""
-    if not _NUMPY_AVAILABLE:
-        logger.warning("  [Tier 3] NumPy not available -- cannot run grid detector.")
-        return None
-
-    atoms = _parse_protein_atoms(pdb_path)
-    if not atoms:
-        logger.warning("  [Tier 3] No ATOM records found.")
-        return None
-
-    coords = np.array([(a[0], a[1], a[2]) for a in atoms])
-    radii = np.array([a[3] for a in atoms])
-
-    logger.info(
-        "  [Tier 3] Building occupancy grid for %d atoms at %s A resolution...",
-        len(atoms), resolution,
-    )
-
-    padding = probe_radius + 3.0
-    mins = coords.min(axis=0) - padding
-    maxs = coords.max(axis=0) + padding
-    shape = tuple(int(math.ceil((maxs[i] - mins[i]) / resolution)) + 1
-                  for i in range(3))
-
-    occupied = np.zeros(shape, dtype=bool)
-
-    for (x, y, z), r in zip(coords, radii):
-        idx = ((np.array([x, y, z]) - mins) / resolution).astype(int)
-        span = int(math.ceil(r / resolution)) + 1
-        xi, yi, zi = idx
-        x_lo, x_hi = max(0, xi - span), min(shape[0], xi + span + 1)
-        y_lo, y_hi = max(0, yi - span), min(shape[1], yi + span + 1)
-        z_lo, z_hi = max(0, zi - span), min(shape[2], zi + span + 1)
-
-        gx = np.arange(x_lo, x_hi)
-        gy = np.arange(y_lo, y_hi)
-        gz = np.arange(z_lo, z_hi)
-        gxx, gyy, gzz = np.meshgrid(gx, gy, gz, indexing="ij")
-        rx = mins[0] + gxx * resolution - x
-        ry = mins[1] + gyy * resolution - y
-        rz = mins[2] + gzz * resolution - z
-        mask = (rx**2 + ry**2 + rz**2) <= r * r
-        occupied[x_lo:x_hi, y_lo:y_hi, z_lo:z_hi] |= mask
-
-    # -- Probe-expanded occupancy for solvent-accessibility test --
-    probe_voxels = max(1, int(math.ceil(probe_radius / resolution)))
-    try:
-        from scipy.ndimage import binary_dilation, generate_binary_structure
-        struct = generate_binary_structure(3, 1)
-        probe_expanded = occupied.copy()
-        for _ in range(probe_voxels):
-            probe_expanded = binary_dilation(probe_expanded, structure=struct)
-        logger.debug("  [Tier 3] Probe dilation via scipy.")
-    except ImportError:
-        logger.debug(
-            "  [Tier 3] scipy not available -- using manual 3-D dilation "
-            "(slower but correct)."
-        )
-        probe_expanded = _manual_dilate_3d(occupied, probe_voxels)
-
-    # -- Flood-fill exterior from all border voxels --
-    exterior = np.zeros(shape, dtype=bool)
-    queue: deque = deque()
-
-    def _seed(ix, iy, iz):
-        if not probe_expanded[ix, iy, iz] and not exterior[ix, iy, iz]:
-            exterior[ix, iy, iz] = True
-            queue.append((ix, iy, iz))
-
-    for ix in range(shape[0]):
-        for iy in range(shape[1]):
-            _seed(ix, iy, 0)
-            _seed(ix, iy, shape[2] - 1)
-    for ix in range(shape[0]):
-        for iz in range(shape[2]):
-            _seed(ix, 0, iz)
-            _seed(ix, shape[1] - 1, iz)
-    for iy in range(shape[1]):
-        for iz in range(shape[2]):
-            _seed(0, iy, iz)
-            _seed(shape[0] - 1, iy, iz)
-
-    directions = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
-    while queue:
-        ix, iy, iz = queue.popleft()
-        for dx, dy, dz in directions:
-            nx, ny, nz = ix + dx, iy + dy, iz + dz
-            if (0 <= nx < shape[0] and 0 <= ny < shape[1] and 0 <= nz < shape[2]):
-                _seed(nx, ny, nz)
-
-    # -- Cavity voxels --
-    cavity_mask = (~occupied) & (~exterior)
-    n_cavity = int(cavity_mask.sum())
-
-    logger.info(
-        "  [Tier 3] Grid shape: %s | occupied: %d | exterior: %d | cavity voxels: %d",
-        shape, int(occupied.sum()), int(exterior.sum()), n_cavity,
-    )
-
-    if n_cavity == 0:
-        logger.warning(
-            "  [Tier 3] No cavity voxels found. Try increasing resolution "
-            "or installing scipy."
-        )
-        return None
-
-    cavity_pts = list(zip(*np.where(cavity_mask)))
-
-    # -- Cluster contiguous cavity voxels (6-connectivity BFS) --
-    visited = np.zeros(shape, dtype=bool)
-    clusters = []
-
-    for seed in cavity_pts:
-        seed = tuple(seed)
-        if visited[seed]:
-            continue
-        cluster = []
-        bfs = deque([seed])
-        visited[seed] = True
-        while bfs:
-            vx = bfs.popleft()
-            cluster.append(vx)
-            for dx, dy, dz in directions:
-                nb = (vx[0] + dx, vx[1] + dy, vx[2] + dz)
-                if (0 <= nb[0] < shape[0] and 0 <= nb[1] < shape[1] and
-                        0 <= nb[2] < shape[2] and cavity_mask[nb] and not visited[nb]):
-                    visited[nb] = True
-                    bfs.append(nb)
-        clusters.append(cluster)
-
-    # -- Discard noise clusters below minimum size --
-    clusters = [c for c in clusters if len(c) >= MIN_CLUSTER_VOXELS]
-    if not clusters:
-        logger.warning("  [Tier 3] No cavity cluster >= %d voxels found.", MIN_CLUSTER_VOXELS)
-        return None
-
-    def _score(cluster):
-        volume = len(cluster)
-        burial_sum = 0.0
-        for vx in cluster:
-            buried = sum(
-                1 for dx, dy, dz in directions
-                if (0 <= vx[0] + dx < shape[0] and 0 <= vx[1] + dy < shape[1] and
-                    0 <= vx[2] + dz < shape[2] and
-                    not exterior[(vx[0] + dx, vx[1] + dy, vx[2] + dz)])
+        if centroid is None:
+            logger.warning(
+                "  [Tier 2] Could not find or parse pocket 1's coordinates "
+                "in '%s' (expected pocket1_vert.pqr or pocket1_atm.pdb).",
+                pockets_dir,
             )
-            burial_sum += buried / 6.0
-        mean_burial = burial_sum / volume
+            return None
 
-        vx_set = set(map(tuple, cluster))
-        surface = sum(
-            1 for vx in cluster
-            if any((vx[0] + dx, vx[1] + dy, vx[2] + dz) not in vx_set
-                   for dx, dy, dz in directions)
+        cx, cy, cz = centroid
+        logger.info(
+            "  [Tier 2] fpocket top pocket (from %s) -> centre (%.3f, %.3f, %.3f)",
+            source, cx, cy, cz,
         )
-        ideal_surface = (36.0 * math.pi * volume * volume) ** (1.0 / 3.0)
-        sphericity = ideal_surface / max(surface, 1e-6)
-
-        return (volume ** 1.5) * (mean_burial ** 0.5) * sphericity
-
-    best_cluster = max(clusters, key=_score)
-    best_score = _score(best_cluster)
-
-    pts = np.array(best_cluster, dtype=float)
-    centre_grid = pts.mean(axis=0)
-    cx = float(mins[0] + centre_grid[0] * resolution)
-    cy = float(mins[1] + centre_grid[1] * resolution)
-    cz = float(mins[2] + centre_grid[2] * resolution)
-
-    logger.info(
-        "  [Tier 3] Best pocket: %d voxels (score=%.1f) | %d valid clusters -> "
-        "centre (%.3f, %.3f, %.3f)",
-        len(best_cluster), best_score, len(clusters), cx, cy, cz,
-    )
-    return cx, cy, cz
+        return cx, cy, cz
 
 
 # --------------------------------------------------------------------------- #
@@ -566,27 +519,38 @@ def detect_active_site(
     raw_pdb: str | None = None,
     center: tuple[float, float, float] | None = None,
     active_site_residues: str | None = None,
+    ligand_resname: str | None = None,
+    ligand_chain: str | None = None,
     visualization_path: str | None = None,
     box_size: float = 25.0,
 ) -> tuple[float, float, float]:
     """Detect (or accept) the docking box center, in priority order:
-    manual coordinates > manual residue selection > Tier 1 > Tier 2 > Tier 3.
+    manual coordinates > manual residue selection > explicit ligand name >
+    Tier 1 (auto-selected co-crystal ligand) > Tier 2 (fpocket).
 
     Parameters
     ----------
     pdb_path : str
         Path to the **prepared** receptor PDB (waters/HETATM removed). Used
-        for Tier 2 (fpocket) and Tier 3 (grid cavity).
+        for Tier 2 (fpocket).
     raw_pdb : str | None
         Path to the **original, unmodified** PDB file that still contains
-        the co-crystallised ligand HETATM records. When provided, Tier 1
-        and the residue-based manual override search this file instead of
+        the co-crystallised ligand HETATM records. When provided, the
+        residue- and ligand-name-based lookups search this file instead of
         ``pdb_path``.
     center : tuple[float, float, float] | None
         Explicit ``(x, y, z)`` override. Highest priority -- always wins.
     active_site_residues : str | None
-        Comma-separated residue spec (e.g. ``"TYR120,GLU150"``). Used if
-        ``center`` is not given.
+        Comma-separated residue spec (e.g. ``"TYR120,GLU150"`` or, for a
+        multi-chain structure, ``"A:TYR120,B:GLU150"``). Used if ``center``
+        is not given.
+    ligand_resname : str | None
+        Exact HETATM residue name to center on (e.g. a cofactor Tier 1
+        would otherwise skip, such as ``"ATP"``). Used if neither
+        ``center`` nor ``active_site_residues`` is given.
+    ligand_chain : str | None
+        Optional chain to disambiguate ``ligand_resname`` when the same
+        residue name appears more than once.
     visualization_path : str | None
         If given, a ``.pml`` PyMOL script is written here showing the
         resulting box.
@@ -597,6 +561,16 @@ def detect_active_site(
     -------
     tuple[float, float, float]
         The ``(x, y, z)`` docking box center.
+
+    Raises
+    ------
+    ValueError
+        If an explicit residue or ligand selection is ambiguous or not
+        found (e.g. an apo structure with no matching HETATM).
+    RuntimeError
+        If no center is given and both automatic tiers (co-crystal ligand,
+        fpocket) fail to find anything -- this never falls back to
+        guessing the protein's centre; it asks for an explicit choice.
     """
     logger.info("=" * 60)
     logger.info("STEP 2 -- Active Site Detection")
@@ -605,7 +579,7 @@ def detect_active_site(
     if not os.path.exists(pdb_path):
         raise FileNotFoundError(f"Prepared protein PDB not found: {pdb_path}")
 
-    # For Tier 1 / residue lookups we prefer the raw (un-stripped) PDB so
+    # For residue/ligand lookups we prefer the raw (un-stripped) PDB so
     # HETATM ligands and full side-chain atoms are still present.
     lookup_pdb = raw_pdb if raw_pdb is not None else pdb_path
     if raw_pdb is not None and not os.path.exists(raw_pdb):
@@ -626,6 +600,9 @@ def detect_active_site(
         residues = parse_residue_spec(active_site_residues)
         result = centroid_from_residues(lookup_pdb, residues)
         method = "manual active-site residues"
+    elif ligand_resname:
+        result = select_ligand_by_name(lookup_pdb, ligand_resname, ligand_chain)
+        method = f"explicit ligand ({ligand_resname})"
     else:
         logger.info("  Tier 1: searching for a co-crystallised ligand in '%s'...", lookup_pdb)
         result = _tier1_cocrystal(lookup_pdb)
@@ -636,21 +613,18 @@ def detect_active_site(
             result = _tier2_fpocket(pdb_path)
             if result is not None:
                 method = "Tier 2 (fpocket)"
-            else:
-                logger.info("  fpocket unavailable or failed -- trying Tier 3 (grid cavity)...")
-                result = _tier3_grid(pdb_path)
-                if result is not None:
-                    method = "Tier 3 (geometric grid cavity)"
 
     if result is None:
         raise RuntimeError(
-            "All active-site detection methods failed.\n"
-            "  - Provide a PDB with a co-crystallised ligand (pass the "
-            "original, pre-preparation file as raw_pdb), OR\n"
-            "  - Install fpocket (https://fpocket.sourceforge.net/), OR\n"
-            "  - Ensure NumPy (+ scipy recommended) is installed, OR\n"
-            "  - Supply --center-x/--center-y/--center-z or "
-            "--active-site-residues manually."
+            "Automatic active-site detection failed: no co-crystallised "
+            "ligand was found and fpocket is unavailable or found nothing "
+            "(this apo/pocket-free case is NOT resolved by guessing the "
+            "protein's geometric centre). Provide one of:\n"
+            "  - Explicit coordinates: --center-x/--center-y/--center-z, OR\n"
+            "  - --active-site-residues (named catalytic residues), OR\n"
+            "  - --ligand-resname (and --ligand-chain) to select a specific "
+            "co-crystallised ligand/cofactor explicitly, OR\n"
+            "  - Install fpocket (https://fpocket.sourceforge.net/)."
         )
 
     logger.info("  Detection method: %s", method)
@@ -661,3 +635,8 @@ def detect_active_site(
         )
 
     return result
+
+
+# Library-API alias (see gnina_vs.__init__): same function, name matching
+# the "resolve_center" step described for programmatic use.
+resolve_center = detect_active_site

@@ -1,0 +1,2 @@
+smiles,id,reaction,enzyme,phase
+OC(=O)c1ccc(cc1)C(C)(C)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1,fexofenadine,oxidation,CYP3A4,I
