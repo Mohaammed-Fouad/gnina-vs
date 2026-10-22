@@ -1,5 +1,0 @@
-Precursor SMILES,Metabolite SMILES,Metabolite ID,Reaction,Enzyme(s),Biosystem
-CC(C)(C)c1ccc(cc1)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1,CC(C)(C)c1ccc(cc1)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1,BTM0001,Hydroxylation,CYP3A4,Human
-CC(C)(C)c1ccc(cc1)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1,OC(=O)c1ccc(cc1)C(C)(C)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1,BTM0002,Oxidation,CYP3A4,Human
-CC(C)(C)c1ccc(cc1)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1,CC(C)(C)c1ccc(cc1)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1OC1OC(C(=O)O)C(O)C(O)C1O,BTM0003,Glucuronidation,UGT1A1,Human
-not-a-smiles,,BTM0004,Unknown,Unknown,Human
