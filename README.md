@@ -17,6 +17,7 @@ This is a refactor of a single-file prototype script into a proper package: ever
   - [Pocket / Active-Site Identification](#pocket--active-site-identification)
   - [Docking](#docking)
   - [Annotation & Toxicity-Relevant Flags](#annotation--toxicity-relevant-flags)
+- [Output Tables](#output-tables)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -508,7 +509,8 @@ Validation is per-field: a missing or invalid value raises `gnina_vs.config.Conf
 | 2 | `ligand.py` (`prepare_ligands_extended`) | Strips salts (largest fragment), neutralizes, canonicalizes tautomers, enumerates *undefined* stereocentres only (capped, default 8) as separate docked entries, protonates at pH 7.4 with Dimorphite-DL if installed (else clearly labeled as unmodified), and records embedding/minimization failures in a table instead of dropping them. |
 | 3 | `config.py` + `metabolite_pipeline.py` | Validates the YAML config; resolves each target's receptor and box exactly once (identical for every compound docked there, recorded in the manifest); warns (never fails) when a compound's estimated extent may not fit the box -- common for glucuronide/sulfate conjugates. |
 | 4 | `validation.py` | Redocks a target's co-crystal ligand and reports heavy-atom RMSD (pass: < 2.0 Å) to `validation_redocking.csv`; a target with no co-crystal ligand is reported as exactly `"not validated: no reference pose"`, never silently skipped. Also docks each target's `reference_ligands` under identical settings for `delta_vs_reference`. |
-| 5 | `compare.py` | `comparison_table.csv`: CNN/Vina affinity and pose score, deltas vs parent and vs reference, ligand efficiency (sign-correct for both score types), per-drug rank and rank change vs parent. Every row traces back to a parent via `parent_id`; failed/NaN docking is kept and flagged, never dropped. |
+| 5 | `compare.py` | The flat comparison frame: CNN/Vina affinity and pose score, deltas vs parent and vs reference, ligand efficiency (sign-correct for both score types), per-drug rank and rank change vs parent. Every row traces back to a parent via `parent_id`; failed/NaN docking is kept and flagged, never dropped. |
+| 6b | `tables.py` | Splits that frame into `compounds`/`poses`/`screen` (one table per observational unit), coerces nullable dtypes, enforces closed `qc_status` vocabularies and key uniqueness at write time, and writes Parquet (authoritative, manifest embedded) plus generated CSV and `data_dictionary.json`. |
 | 6 | `annotate.py`, `applicability.py` | Adds (never filters on) RDKit properties, Lipinski violation count, per-family structural-alert counts across RDKit's catalogs (Brenk, PAINS A/B/C, NIH, ZINC, ChEMBL), a heuristic glucuronide/sulfate `conjugate_flag`, a heuristic `exposure_plausibility` tier, an ADMET-AI hook that skips gracefully (with `admet_status` saying so) if the optional package isn't installed, and a k-NN applicability-domain check against ADMET-AI's own TDC training chemistry. |
 | 7 | `figures.py` | Metabolic tree (parent → metabolites, colored by delta), parent-vs-metabolite bar chart per target, compound×target heatmap, and a score-vs-molecular-weight scatter (exposes size bias) -- PNG + SVG, headless. 2D interaction diagrams (PLIP/ProLIF) are a documented `NotImplementedError` stub: neither package was available to build and test against here. |
 
@@ -516,7 +518,9 @@ Validation is per-field: a missing or invalid value raises `gnina_vs.config.Conf
 
 - `metabolites.csv`, `prepared_ligands.sdf` / `.csv` (shared across all drugs and targets), `ligand_prep_failures.csv` (if any)
 - `<target_id>/`: `receptor_prepared.pdb`, `docking_box.pml`, `results_summary.csv`, `top_results.xlsx`, `ranked_docked.sdf`, `comparison_table.csv` (this target only), plus the redocking/reference-ligand working files
-- `comparison_table.csv` (all targets combined, with annotations), `validation_redocking.csv`, `run_manifest.json`
+- `tables/` -- the authoritative output, split into three grains (see [Output Tables](#output-tables)): `compounds.parquet`, `poses.parquet`, `screen.parquet`, each with a generated `.csv` beside it, plus `data_dictionary.json`
+- `comparison_table.csv` (all targets combined, with annotations) -- kept as a **generated legacy view**; new code should read `screen` joined to `compounds`
+- `validation_redocking.csv`, `run_manifest.json`
 - `figures/`: one PNG+SVG pair per metabolic tree, per-target bar chart, the compound×target heatmap, and the MW scatter
 
 ---
@@ -572,7 +576,7 @@ CPD001,OC(=O)c1ccc(cc1)C(C)(C)C(O)CCCN1CCC(CC1)C(O)(c1ccccc1)c1ccccc1,fexofenadi
 Everything lands under `--outdir` (`results/my_screen` above), alongside the usual `run` outputs:
 
 - **`metabolites.csv`** -- every parent + predicted/curated metabolite that was generated, before docking.
-- **`comparison_table.csv`** -- the main new output. One row per docked compound: docking scores, `delta_*_vs_parent` (does the metabolite bind better or worse than the original compound?), ligand efficiency, and the annotation columns from [Annotation & Toxicity-Relevant Flags](#annotation--toxicity-relevant-flags).
+- **`tables/`** -- the main new output, split into three grains (see [Output Tables](#output-tables)). `screen.parquet` is the triage grain: one row per target+compound with ligand efficiency, `dcmp_*_vs_parent` (does the metabolite bind better or worse than the original compound?) and rank bands. `compounds.parquet` carries one row per molecule with the annotation columns from [Annotation & Toxicity-Relevant Flags](#annotation--toxicity-relevant-flags). `comparison_table.csv` is still written as a flat legacy view.
 - **`results_summary.csv`** / **`top_results.xlsx`** / **`ranked_docked.sdf`** -- the normal `run` outputs, now covering parents and metabolites together.
 - **`ligand_prep_failures.csv`** -- only written if a compound couldn't be embedded/minimized; it's reported here, never silently dropped.
 
@@ -604,7 +608,9 @@ gnina-vs/
         ├── config.py               # Phase 3: metabolite-run YAML schema + validation
         ├── metabolite_pipeline.py  # Phase 3: orchestrates Phases 1/2/4/5/6/7
         ├── validation.py           # Phase 4: redocking RMSD + reference-ligand docking
-        ├── compare.py              # Phase 5: comparison_table.csv (deltas, LE, ranks)
+        ├── compare.py              # Phase 5: flat comparison frame (deltas, LE, ranks)
+        ├── tables.py               # Phase 6b: compounds/poses/screen split, Parquet + manifest
+        ├── applicability.py        # Phase 6: k-NN applicability domain vs TDC training chemistry
         ├── annotate.py             # Phase 6: RDKit properties, Brenk/PAINS, conjugate flag
         └── figures.py              # Phase 7: metabolic tree, bar chart, heatmap, scatter
 ```
@@ -626,6 +632,30 @@ Running `gnina-vs run --outdir <outdir>` generates:
 - `<outdir>/run_manifest.json`: the seed, box center/size, CNN scoring settings, and package/tool versions used, for reproducibility.
 
 `gnina-vs recover` writes the same `results_summary.csv` / `top_results.xlsx` / `ranked_docked.sdf` / `run_manifest.json` set (no receptor/ligand/docking files, since nothing is re-run).
+
+---
+
+## Output Tables
+
+The screening output is split into **three tables, one per observational unit**, written to `tables/` with Parquet authoritative and CSV generated from it.
+
+| Table | Grain | Key | Carries |
+|---|---|---|---|
+| `compounds` | one row per molecule | `compound_id` | identity, InChIKey, metabolite provenance (`met_depth`/`met_phase`/`met_reaction`), all `mol_*` descriptors, `alert_*` counts, `flag_*`, `exposure_*`, `parent_tanimoto`, `admet_*`, `ad_*` |
+| `poses` | one row per target x compound x pose | (`target_id`, `compound_id`, `pose_rank`) | raw scores only: `dock_cnn_affinity`, `dock_vina_affinity_kcal_mol`, `dock_cnn_score`, `qc_pose_quality`, `qc_status`, `run_id` |
+| `screen` | one row per target x compound | (`target_id`, `compound_id`) | everything derived: `le_*_per_heavy_atom`, `dcmp_*_vs_parent`, `dcmp_*_vs_ref`, `rank_band_in_group`, `rank_band_change_vs_parent` |
+
+Why split at all: the old flat table repeated every molecular descriptor, alert and ADMET prediction once per target, which is duplication that becomes a correctness hazard the moment one copy is edited; and `rank_in_group` did not say whether it ranked over compounds or over poses, because both lived in one table. `screen` is **derived** from `poses` by a documented rule (best CNNaffinity, else `pose_rank == 1`) and is never hand-maintained. 3D coordinates stay outside all three, in SDF keyed by `pose_key`.
+
+**There is no community schema for docking output**, and no cheminformatics column-naming standard. Two literature searches turned up only tool-specific exports (Meeko, FRED, GOLD). This layout is therefore a *local convention*: `schema_version` in `data_dictionary.json` is the only compatibility signal, and that file states as much.
+
+**Parquet is authoritative for a verified reason.** Writing `{'a': [1.0, None], 'b': [True, None], 'c': ['X', None]}` to CSV and reading it back returns `b` as `object` holding the string `'True'`, with the missing boolean and the missing string indistinguishable empty fields; Parquet preserves `double`, nullable `bool` and `large_string` exactly. Parquet also carries file-level key-value metadata, so the run manifest is embedded in each file as well as written to `run_manifest.json` -- a table emailed without its folder is the normal failure mode. Needs `pip install gnina-vs[tables]`; without pyarrow the tables are written as CSV only, with a warning, and the type fidelity is lost.
+
+**Scores are banded, not ranked to the integer.** `rank_band_in_group` reports a tier (`best`/`upper`/`middle`/`lower`) rather than a position, and `dcmp_cnn_band_vs_parent` collapses any change smaller than the scoring function's resolution into a single `no_meaningful_change` bin. Reporting an integer rank or a three-decimal score is an implied-precision claim that nothing in the docking literature supports. The two resolution constants in `tables.py` -- `CNN_AFFINITY_RESOLUTION` (0.5 pKd units) and `VINA_AFFINITY_RESOLUTION` (1.0 kcal/mol) -- **are placeholders and are not validated**: 1 kcal/mol is a widely repeated rule of thumb, but no source quantified either value, and no paper quantifying docking-score-versus-measured-affinity correlation was retrieved at all. Set them from your own redocking spread and state the value you used.
+
+**The no-drop rule is now architectural rather than conventional.** A compound that fails on target A but succeeds on B gets a `poses` row for A with `qc_status='dock_failed'`, null scores, null `pose_rank` and null `pose_key`, plus normal rows for B -- and exactly one `compounds` row regardless. An unparseable SMILES gets one `compounds` row with `qc_status='smiles_invalid'`, so it stays countable in denominators. Scores are nulled wherever `qc_status != 'ok'`, so a failed job can never show a score. Four uniqueness and referential checks run at write time and raise rather than warn, so a broken schema cannot reach disk. Note that no other pipeline documents a convention for retaining failed dockings as rows (DOCKSTRING drops them, discarding 1.8% of molecules) -- this is a defensible local policy, not an inherited standard.
+
+**Current limitation: the `poses` grain is not yet real.** `reporter._parse_gnina_log` stops at mode 1 by design, so the pipeline carries exactly one pose per compound and every `poses` row has `pose_rank == 1`. The keys and the selection rule are already correct for the multi-pose case, so making it real is a change to score extraction in `reporter.py` and nothing in `tables.py`. That change was deliberately not made blind -- parsing every mode across gnina versions cannot be validated against the fixtures in this repo alone -- and it is a prerequisite for PoseBusters gating, interaction-difference tables and showing more than the top pose.
 
 ---
 

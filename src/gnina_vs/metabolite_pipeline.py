@@ -16,12 +16,15 @@ from __future__ import annotations
 import json
 import logging
 import platform
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 from rdkit import Chem
 
-from gnina_vs import __version__, annotate, compare, docking, figures, ligand, metabolism, pocket, protein, validation
+from gnina_vs import (__version__, annotate, compare, docking, figures, ligand, metabolism,
+                      pocket, protein, tables, validation)
 from gnina_vs.config import RunConfig, TargetConfig
 from gnina_vs.reporter import extract_results
 
@@ -173,6 +176,11 @@ def run_metabolite_pipeline(config: RunConfig) -> dict:
             drugs_by_target.setdefault(tid, []).append(drug.id)
 
     manifest = {
+        # run_id ties every emitted row back to this run, and is the one
+        # manifest field that also lives as a column (in poses.run_id).
+        "run_id": uuid.uuid4().hex[:12],
+        "started_utc": datetime.now(timezone.utc).isoformat(),
+        "schema_version": tables.SCHEMA_VERSION,
         "seed": config.seed, "outdir": str(outdir), "docking": vars(config.docking),
         "targets": {}, "versions": _package_versions(config.docking.gnina_exec),
     }
@@ -250,8 +258,33 @@ def run_metabolite_pipeline(config: RunConfig) -> dict:
     # -- Phase 6: annotations (columns only) --
     if not comparison_all.empty:
         comparison_all = annotate.add_annotations(comparison_all, smiles_col="smiles")
+
+    # -- Phase 6b: split into three grains, Parquet authoritative --
+    # compounds / poses / screen, written with nullable dtypes and the run
+    # manifest embedded in the Parquet metadata. comparison_table.csv is kept
+    # as a GENERATED legacy view so existing scripts and figures keep working;
+    # new code should read screen joined to compounds.
+    table_paths: dict[str, str] = {}
     comparison_path = outdir / "comparison_table.csv"
-    comparison_all.to_csv(comparison_path, index=False)
+    if not comparison_all.empty:
+        try:
+            split = tables.split_tables(comparison_all, run_id=manifest.get("run_id"))
+            table_paths = tables.write_tables(split, outdir / "tables", manifest=manifest)
+            logger.info(
+                "  [tables] compounds=%d  poses=%d  screen=%d -> '%s'.",
+                len(split["compounds"]), len(split["poses"]), len(split["screen"]),
+                outdir / "tables",
+            )
+            comparison_all.to_csv(comparison_path, index=False, na_rep="NA")
+        except Exception as exc:
+            # The split must never cost the run its results.
+            logger.warning(
+                "  [tables] splitting the output failed (%s) -- only the flat "
+                "comparison_table.csv was written.", exc,
+            )
+            comparison_all.to_csv(comparison_path, index=False, na_rep="NA")
+    else:
+        comparison_all.to_csv(comparison_path, index=False, na_rep="NA")
 
     validation_df = pd.DataFrame(
         validation_rows, columns=["target_id", "status", "rmsd"],
@@ -302,4 +335,5 @@ def run_metabolite_pipeline(config: RunConfig) -> dict:
         "validation_redocking": str(validation_path),
         "run_manifest": str(manifest_path),
         "figures": figure_paths,
+        **table_paths,
     }

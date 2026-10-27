@@ -48,6 +48,11 @@ annotate = ["admet-ai"]
 # ADMET-AI's TDC training data. Without them the ad_* columns stay empty with
 # the reason in ad_status. The TDC download path is unverified -- see README.
 applicability = ["scikit-fingerprints>=1.10", "PyTDC"]
+# Parquet output for the three-grain tables (Phase 6b). Without pyarrow the
+# tables are written as CSV only, with a warning: a CSV round-trip degrades
+# booleans to strings and makes a missing value indistinguishable from an
+# empty one, which is why Parquet is the authoritative copy.
+tables = ["pyarrow>=14"]
 # Phase 7 figures (metabolic tree, bar chart, heatmap, MW scatter).
 figures = ["matplotlib>=3.5"]
 
