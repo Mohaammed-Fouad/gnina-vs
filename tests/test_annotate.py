@@ -68,10 +68,29 @@ def test_plain_compound_not_flagged_as_conjugate():
     assert a["conjugate_flag"] is False
 
 
-def test_admet_status_reflects_missing_dependency():
+def test_annotate_smiles_leaves_row_context_columns_empty():
     a = annotate.annotate_smiles("CCO")
-    assert "admet_ai not installed" in a["admet_status"] or a["admet_status"] == "computed"
-    assert a["admet_applicability_flag"] == "not_implemented"
+    assert a["parent_tanimoto"] is None
+    assert a["admet_status"] is None and a["admet_applicability_flag"] is None
+
+
+def test_physchem_out_of_range_flags_small_molecule():
+    assert "MW=" in annotate.annotate_smiles("CCO")["physchem_out_of_range"]  # MW 46 < 100
+    assert annotate.annotate_smiles("CC(=O)Nc1ccc(O)cc1")["physchem_out_of_range"] is None
+
+
+def test_admet_status_without_dependency(monkeypatch):
+    monkeypatch.setattr(annotate, "_admet_ai_available", lambda: False)
+    out = annotate.add_annotations(pd.DataFrame({"smiles": ["CC(=O)Nc1ccc(O)cc1", "bad"]}))
+    assert out.iloc[0]["admet_status"] == "skipped: admet_ai not installed"
+    assert out.iloc[1]["admet_status"] == "skipped: invalid_smiles"
+    assert out.iloc[0]["admet_applicability_flag"].startswith("not_evaluated")
+    assert out.iloc[1]["admet_applicability_flag"] == "not_evaluated: invalid_smiles"
+
+
+def test_admet_disabled():
+    out = annotate.add_annotations(pd.DataFrame({"smiles": ["CCO"]}), run_admet=False)
+    assert out.iloc[0]["admet_status"] == "skipped: disabled"
 
 
 # --------------------------------------------------------------------------- #
@@ -100,3 +119,72 @@ def test_add_annotations_does_not_mutate_input():
     original_cols = list(df.columns)
     annotate.add_annotations(df)
     assert list(df.columns) == original_cols  # input untouched
+
+
+# --------------------------------------------------------------------------- #
+# Parent similarity & applicability-domain proxy
+# --------------------------------------------------------------------------- #
+PARACETAMOL = "CC(=O)Nc1ccc(O)cc1"
+PARA_GLUC = "CC(=O)Nc1ccc(OC2OC(C(=O)O)C(O)C(O)C2O)cc1"
+PARA_SULF = "CC(=O)Nc1ccc(OS(=O)(=O)O)cc1"
+
+
+def _comparison_like_df():
+    # Mirrors compare.build_comparison_table: parent_id + is_parent, no parent_smiles.
+    return pd.DataFrame({
+        "compound_id": ["p", "m1", "m2", "m3"],
+        "parent_id": ["p", "p", "p", "p"],
+        "is_parent": [True, False, False, False],
+        "smiles": [PARACETAMOL, PARA_GLUC, PARA_SULF, "not-a-smiles"],
+    })
+
+
+def test_parent_tanimoto_derived_from_parent_id():
+    out = annotate.add_annotations(_comparison_like_df(), run_admet=False)
+    assert pd.isna(out.iloc[0]["parent_tanimoto"])          # parent not compared with itself
+    assert 0 < out.iloc[1]["parent_tanimoto"] < 1
+    assert 0 < out.iloc[2]["parent_tanimoto"] < 1
+    assert pd.isna(out.iloc[3]["parent_tanimoto"])          # invalid SMILES
+
+
+def test_parent_tanimoto_from_explicit_column_with_missing_parent():
+    # NaN parent_smiles used to crash the AD check (bool(nan) is True).
+    df = pd.DataFrame({"smiles": ["CCO", PARA_GLUC], "parent_smiles": [float("nan"), PARACETAMOL]})
+    out = annotate.add_annotations(df, run_admet=False)
+    assert pd.isna(out.iloc[0]["parent_tanimoto"])
+    assert out.iloc[1]["parent_tanimoto"] > 0
+
+
+def test_parent_tanimoto_absent_without_parent_info():
+    out = annotate.add_annotations(pd.DataFrame({"smiles": [PARACETAMOL]}), run_admet=False)
+    assert pd.isna(out.iloc[0]["parent_tanimoto"])
+
+
+def test_applicability_flag_when_admet_computed(monkeypatch):
+    monkeypatch.setattr(annotate, "_admet_ai_available", lambda: True)
+    monkeypatch.setattr(
+        annotate, "try_admet_ai",
+        lambda smi: pd.DataFrame({"hERG": [0.1 * (i + 1) for i in range(len(smi))]}, index=smi),
+    )
+    out = annotate.add_annotations(_comparison_like_df())
+    assert list(out["admet_status"][:3]) == ["computed"] * 3
+    assert out.iloc[0]["admet_applicability_flag"] == "inside_proxy_domain"
+    assert out.iloc[1]["admet_applicability_flag"].startswith("outside_proxy_domain")
+    assert "parent_tanimoto" in out.iloc[1]["admet_applicability_flag"]
+    # predictions merged with prefix, one value per valid row, NaN for the invalid row
+    assert "admet_hERG" in out.columns
+    assert out["admet_hERG"].iloc[:3].notna().all() and pd.isna(out.iloc[3]["admet_hERG"])
+    assert len(out) == 4 and list(out["compound_id"]) == ["p", "m1", "m2", "m3"]
+
+
+def test_admet_failure_is_reported(monkeypatch):
+    monkeypatch.setattr(annotate, "_admet_ai_available", lambda: True)
+    monkeypatch.setattr(annotate, "try_admet_ai", lambda smi: None)
+    out = annotate.add_annotations(pd.DataFrame({"smiles": [PARACETAMOL]}))
+    assert out.iloc[0]["admet_status"] == "failed: see log"
+    assert out.iloc[0]["admet_applicability_flag"].startswith("not_evaluated")
+
+
+def test_no_deprecation_warnings(recwarn):
+    annotate.add_annotations(_comparison_like_df(), run_admet=False)
+    assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]

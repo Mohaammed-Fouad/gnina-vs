@@ -1,149 +1,136 @@
 """
 gnina_vs.annotate
-======================
-Phase 6: annotation columns only -- MW/logP/TPSA/HBD/HBA/rotatable bonds,
-Lipinski violation count, Brenk/PAINS structural alerts, a heuristic
-Phase-II conjugate flag, and an optional ADMET-AI hook. Per the project's
-non-negotiable design principle, nothing here ever removes or routes a
-compound; every function only adds columns.
+=================
+Phase 6: annotation columns only.
+
+Adds, per compound:
+
+* RDKit descriptors -- MW, Crippen logP, TPSA, HBD, HBA, rotatable bonds,
+  formal charge -- and a Lipinski Rule-of-Five violation count.
+* Brenk and PAINS structural alerts (``reactive_alert`` is set from Brenk).
+* A heuristic Phase-II conjugate flag (glucuronide / sulfate ester).
+* Optional ADMET-AI predictions (``admet_*`` columns) when the ``admet_ai``
+  package is installed.
+* A heuristic applicability-domain *proxy* for those predictions:
+  ``physchem_out_of_range`` (descriptor bounding box), ``parent_tanimoto``
+  (Morgan similarity to the compound's parent) and the combined
+  ``admet_applicability_flag``.
+
+Per the project's non-negotiable design principle, nothing here removes,
+reorders or routes a compound; every function only adds columns.
+
+Notes on the applicability-domain proxy
+---------------------------------------
+ADMET-AI does not expose its training-set domain, so this is a proxy, not
+a true AD. Two known biases:
+
+* Phase-II conjugates (glucuronides especially) add many fingerprint bits
+  and routinely fall below the similarity threshold to their parent; read
+  ``parent_tanimoto`` together with ``conjugate_flag``.
+* Similarity to the parent says nothing about coverage of ADMET-AI's
+  training data; a compound can be dissimilar to its parent yet
+  well-represented there, and vice versa.
+
+All thresholds below are research-triage heuristics, not validated cutoffs.
 """
 
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 
 import pandas as pd
-from rdkit import Chem
-from rdkit.Chem import AllChem, Crippen, Descriptors, FilterCatalog, Lipinski
-from rdkit import DataStructs
+from rdkit import Chem, DataStructs
+from rdkit.Chem import Crippen, Descriptors, Lipinski, rdFingerprintGenerator
+from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------- #
+# Columns
+# --------------------------------------------------------------------------- #
 ANNOTATION_COLUMNS = [
     "mol_weight_annot", "clogp", "tpsa", "hbd", "hba", "rotatable_bonds", "formal_charge",
     "lipinski_violations",
     "brenk_alerts", "pains_alerts", "reactive_alert",
     "glucuronide_flag", "sulfate_flag", "conjugate_flag",
+    "physchem_out_of_range", "parent_tanimoto",
     "admet_status", "admet_applicability_flag",
 ]
+ADMET_PREFIX = "admet_"
 
-# Heuristic substructure patterns -- approximate detectors for research
-# triage, not an authoritative metabolite classifier. A glucuronide is
-# matched as an oxygen-linked pyranose ring bearing a carboxylic acid
-# (ignoring stereochemistry); a sulfate ester as -O-S(=O)(=O)-O-.
-_GLUCURONIDE_SMARTS = Chem.MolFromSmarts("[OX2]C1OC(C(=O)[OX1,OX2H1])C(O)C(O)C1")
-_SULFATE_SMARTS = Chem.MolFromSmarts("[OX2]S(=O)(=O)[OX2]")
+# --------------------------------------------------------------------------- #
+# Heuristic thresholds (triage only -- see module docstring)
+# --------------------------------------------------------------------------- #
+MW_RANGE = (100.0, 800.0)
+LOGP_RANGE = (-5.0, 7.0)
+TPSA_MAX = 200.0
+PARENT_SIMILARITY_MIN = 0.4  # Morgan r=2, 2048 bits, Tanimoto
 
-_catalog_cache: FilterCatalog.FilterCatalog | None = None
+# Glucuronide: O-linked pyranose ring bearing a carboxylic acid (no stereo).
+# Sulfate ester: -O-S(=O)(=O)-O-.
+_GLUCURONIDE = Chem.MolFromSmarts("[OX2]C1OC(C(=O)[OX1,OX2H1])C(O)C(O)C1")
+_SULFATE = Chem.MolFromSmarts("[OX2]S(=O)(=O)[OX2]")
 
-
-def _get_filter_catalog() -> FilterCatalog.FilterCatalog:
-    global _catalog_cache
-    if _catalog_cache is None:
-        params = FilterCatalog.FilterCatalogParams()
-        params.AddCatalog(FilterCatalog.FilterCatalogParams.FilterCatalogs.PAINS)
-        params.AddCatalog(FilterCatalog.FilterCatalogParams.FilterCatalogs.BRENK)
-        _catalog_cache = FilterCatalog.FilterCatalog(params)
-    return _catalog_cache
+_MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
 
-def _lipinski_violations(mw, logp, hbd, hba) -> int:
-    return sum([mw > 500, logp > 5, hbd > 5, hba > 10])
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _build_catalog(which: FilterCatalogParams.FilterCatalogs) -> FilterCatalog:
+    params = FilterCatalogParams()
+    params.AddCatalog(which)
+    return FilterCatalog(params)
 
 
-def check_applicability_domain(metabolite_smiles, parent_smiles, mol_weight, logp, tpsa):
-    """
-    Evaluates the Applicability Domain (AD) of a molecule for ADMET-AI.
-    Flags compounds that are either structurally disjoint from the parent 
-    or fall outside the physicochemical bounding box of typical ADMET training data.
-    """
+# Separate catalogs, so PAINS vs Brenk never depends on entry metadata.
+_PAINS = _build_catalog(FilterCatalogParams.FilterCatalogs.PAINS)
+_BRENK = _build_catalog(FilterCatalogParams.FilterCatalogs.BRENK)
+
+
+def _alerts(catalog: FilterCatalog, mol: Chem.Mol) -> list[str]:
+    return [m.GetDescription() for m in catalog.GetMatches(mol)]
+
+
+def _mol_from_smiles(smiles) -> Chem.Mol | None:
+    """Parse a SMILES, returning None for anything that isn't a parseable
+    non-empty string (None, NaN, numbers, garbage)."""
+    if not isinstance(smiles, str) or not smiles.strip():
+        return None
+    return Chem.MolFromSmiles(smiles)
+
+
+@lru_cache(maxsize=None)
+def _fingerprint(smiles: str):
+    mol = _mol_from_smiles(smiles)
+    return _MORGAN.GetFingerprint(mol) if mol is not None else None
+
+
+def _lipinski_violations(mw: float, logp: float, hbd: int, hba: int) -> int:
+    return int(sum([mw > 500, logp > 5, hbd > 5, hba > 10]))
+
+
+def _physchem_out_of_range(mw: float, logp: float, tpsa: float) -> str | None:
     flags = []
-    
-    # 1. Physicochemical Bounding Box Check (Typical TDC/DrugBank ranges)
-    if pd.isna(mol_weight) or pd.isna(logp) or pd.isna(tpsa):
-        return "outside_domain: missing_descriptors"
-        
-    if mol_weight > 800 or mol_weight < 100:
-        flags.append("out_of_bounds_MW")
-    if logp > 7 or logp < -5:
-        flags.append("out_of_bounds_LogP")
-    if tpsa > 200:
-        flags.append("out_of_bounds_TPSA")
-        
-    # 2. Structural Tanimoto Similarity Check vs Parent
-    if metabolite_smiles and parent_smiles and metabolite_smiles != parent_smiles:
-        met_mol = Chem.MolFromSmiles(metabolite_smiles)
-        par_mol = Chem.MolFromSmiles(parent_smiles)
-        
-        if met_mol and par_mol:
-            met_fp = AllChem.GetMorganFingerprintAsBitVect(met_mol, radius=2, nBits=2048)
-            par_fp = AllChem.GetMorganFingerprintAsBitVect(par_mol, radius=2, nBits=2048)
-            
-            similarity = DataStructs.TanimotoSimilarity(met_fp, par_fp)
-            
-            # Threshold: 0.4 is a common cutoff for structurally distinct chemical spaces
-            if similarity < 0.4:
-                flags.append(f"low_parent_similarity_{similarity:.2f}")
-
-    # Resolve the final flag
-    if not flags:
-        return "inside_domain"
-    else:
-        return "outside_domain: " + " | ".join(flags)
+    if not MW_RANGE[0] <= mw <= MW_RANGE[1]:
+        flags.append(f"MW={mw:.0f}")
+    if not LOGP_RANGE[0] <= logp <= LOGP_RANGE[1]:
+        flags.append(f"logP={logp:.1f}")
+    if tpsa > TPSA_MAX:
+        flags.append(f"TPSA={tpsa:.0f}")
+    return ";".join(flags) if flags else None
 
 
-def annotate_smiles(smiles: str) -> dict:
-    """Compute every annotation for one SMILES string. Returns a dict with
-    `ANNOTATION_COLUMNS` as keys; every value is None (not a fabricated
-    default) if the SMILES doesn't parse."""
-    empty = {c: None for c in ANNOTATION_COLUMNS}
-    if not isinstance(smiles, str):
-        return empty
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return empty
-
-    mw = Descriptors.MolWt(mol)
-    logp = Crippen.MolLogP(mol)
-    tpsa = Descriptors.TPSA(mol)
-    hbd = Lipinski.NumHDonors(mol)
-    hba = Lipinski.NumHAcceptors(mol)
-    rot = Lipinski.NumRotatableBonds(mol)
-    charge = Chem.GetFormalCharge(mol)
-
-    catalog = _get_filter_catalog()
-    matches = catalog.GetMatches(mol)
-    brenk_hits = [m.GetDescription() for m in matches if "brenk" in m.GetProp("FilterSet").lower()] \
-        if matches else []
-    pains_hits = [m.GetDescription() for m in matches if "pains" in m.GetProp("FilterSet").lower()] \
-        if matches else []
-    # Some RDKit builds don't expose "FilterSet"; fall back to "all matches
-    # go in both lists" so alerts are never silently lost.
-    if matches and not brenk_hits and not pains_hits:
-        brenk_hits = pains_hits = [m.GetDescription() for m in matches]
-
-    glucuronide = _GLUCURONIDE_SMARTS is not None and mol.HasSubstructMatch(_GLUCURONIDE_SMARTS)
-    sulfate = _SULFATE_SMARTS is not None and mol.HasSubstructMatch(_SULFATE_SMARTS)
-
-    return {
-        "mol_weight_annot": mw,
-        "clogp": logp,
-        "tpsa": tpsa,
-        "hbd": hbd,
-        "hba": hba,
-        "rotatable_bonds": rot,
-        "formal_charge": charge,
-        "lipinski_violations": _lipinski_violations(mw, logp, hbd, hba),
-        "brenk_alerts": ";".join(brenk_hits) if brenk_hits else None,
-        "pains_alerts": ";".join(pains_hits) if pains_hits else None,
-        "reactive_alert": bool(brenk_hits),
-        "glucuronide_flag": bool(glucuronide),
-        "sulfate_flag": bool(sulfate),
-        "conjugate_flag": bool(glucuronide or sulfate),
-        # ADMET-AI is an optional dependency; skipped gracefully when absent
-        "admet_status": "skipped: admet_ai not installed" if not _admet_ai_available() else "computed",
-        "admet_applicability_flag": "not_implemented",  # This stub is now overwritten in add_annotations
-    }
+def parent_similarity(smiles, parent_smiles) -> float | None:
+    """Morgan (r=2, 2048-bit) Tanimoto similarity between a compound and its
+    parent. Returns None if either SMILES is missing or unparseable."""
+    if not isinstance(smiles, str) or not isinstance(parent_smiles, str):
+        return None
+    fp, parent_fp = _fingerprint(smiles), _fingerprint(parent_smiles)
+    if fp is None or parent_fp is None:
+        return None
+    return float(DataStructs.TanimotoSimilarity(fp, parent_fp))
 
 
 def _admet_ai_available() -> bool:
@@ -154,48 +141,182 @@ def _admet_ai_available() -> bool:
         return False
 
 
+# --------------------------------------------------------------------------- #
+# Per-molecule annotation
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=None)
+def _annotate_cached(smiles: str) -> tuple:
+    mol = _mol_from_smiles(smiles)
+    if mol is None:
+        return tuple((c, None) for c in ANNOTATION_COLUMNS)
+
+    mw = Descriptors.MolWt(mol)
+    logp = Crippen.MolLogP(mol)
+    tpsa = Descriptors.TPSA(mol)
+    hbd = Lipinski.NumHDonors(mol)
+    hba = Lipinski.NumHAcceptors(mol)
+
+    brenk = _alerts(_BRENK, mol)
+    pains = _alerts(_PAINS, mol)
+    glucuronide = mol.HasSubstructMatch(_GLUCURONIDE)
+    sulfate = mol.HasSubstructMatch(_SULFATE)
+
+    row = {
+        "mol_weight_annot": mw,
+        "clogp": logp,
+        "tpsa": tpsa,
+        "hbd": hbd,
+        "hba": hba,
+        "rotatable_bonds": Lipinski.NumRotatableBonds(mol),
+        "formal_charge": Chem.GetFormalCharge(mol),
+        "lipinski_violations": _lipinski_violations(mw, logp, hbd, hba),
+        "brenk_alerts": ";".join(brenk) if brenk else None,
+        "pains_alerts": ";".join(pains) if pains else None,
+        "reactive_alert": bool(brenk),
+        "glucuronide_flag": bool(glucuronide),
+        "sulfate_flag": bool(sulfate),
+        "conjugate_flag": bool(glucuronide or sulfate),
+        "physchem_out_of_range": _physchem_out_of_range(mw, logp, tpsa),
+        # Row-context columns, filled by add_annotations():
+        "parent_tanimoto": None,
+        "admet_status": None,
+        "admet_applicability_flag": None,
+    }
+    return tuple(row.items())
+
+
+def annotate_smiles(smiles) -> dict:
+    """Compute every per-molecule annotation for one SMILES.
+
+    Returns a dict keyed by `ANNOTATION_COLUMNS`. Every value is None (never
+    a fabricated default) if the SMILES doesn't parse. ``parent_tanimoto``,
+    ``admet_status`` and ``admet_applicability_flag`` need table context
+    (the parent, the batch ADMET run) and are left None here; they are
+    filled by `add_annotations`.
+    """
+    if not isinstance(smiles, str):
+        return {c: None for c in ANNOTATION_COLUMNS}
+    return dict(_annotate_cached(smiles))
+
+
+# --------------------------------------------------------------------------- #
+# ADMET-AI (optional)
+# --------------------------------------------------------------------------- #
 def try_admet_ai(smiles_list: list[str]) -> pd.DataFrame | None:
-    """Run ADMET-AI predictions if the optional `admet_ai` package is
-    installed; otherwise return None and let the caller skip gracefully
-    (per the project's "optional dependencies fail gracefully" rule).
-    Not exercised by the test suite since admet_ai is not a dependency."""
+    """Run ADMET-AI on ``smiles_list`` if the optional ``admet_ai`` package is
+    installed. Returns a DataFrame indexed by SMILES, or None if the package
+    is missing or prediction fails (the caller then skips gracefully)."""
+    if not smiles_list:
+        return None
     if not _admet_ai_available():
         logger.info("  [annotate] admet_ai not installed -- skipping ADMET predictions.")
         return None
-    try:
-        from admet_ai import ADMETModel  # pragma: no cover
-        model = ADMETModel()
-        return model.predict(smiles=smiles_list)
+    try:  # pragma: no cover - admet_ai is not a test dependency
+        from admet_ai import ADMETModel
+        preds = ADMETModel().predict(smiles=list(smiles_list))
+        if not isinstance(preds, pd.DataFrame):
+            raise TypeError(f"unexpected return type {type(preds).__name__}")
+        if len(preds) != len(smiles_list):
+            raise ValueError(f"{len(preds)} predictions for {len(smiles_list)} SMILES")
+        preds.index = list(smiles_list)
+        return preds
     except Exception as exc:  # pragma: no cover
         logger.warning("  [annotate] admet_ai prediction failed (%s) -- skipping.", exc)
         return None
 
 
-def add_annotations(df: pd.DataFrame, smiles_col: str = "smiles") -> pd.DataFrame:
-    """Add every annotation column to ``df`` (one row per compound already
-    present) as new columns only -- never removes or reorders rows."""
+# --------------------------------------------------------------------------- #
+# Table-level annotation
+# --------------------------------------------------------------------------- #
+def _resolve_parent_smiles(df: pd.DataFrame, smiles_col: str) -> pd.Series:
+    """Return each row's parent SMILES (NaN where unknown or the row is a parent).
+
+    Uses an explicit ``parent_smiles`` column when present; otherwise derives
+    it from ``parent_id`` + ``is_parent`` as produced by
+    `gnina_vs.compare.build_comparison_table`.
+    """
+    empty = pd.Series(pd.NA, index=df.index, dtype=object)
+    is_parent = (df["is_parent"] == True) if "is_parent" in df.columns else None  # noqa: E712
+
+    if "parent_smiles" in df.columns:
+        parents = df["parent_smiles"].astype(object)
+    elif "parent_id" in df.columns and is_parent is not None:
+        parent_rows = df.loc[is_parent & df[smiles_col].map(lambda s: _mol_from_smiles(s) is not None)]
+        lookup = parent_rows.drop_duplicates("parent_id").set_index("parent_id")[smiles_col]
+        parents = df["parent_id"].map(lookup).astype(object)
+    else:
+        return empty
+
+    if is_parent is not None:
+        parents = parents.where(~is_parent, pd.NA)  # a parent isn't compared with itself
+    return parents
+
+
+def _applicability_flag(admet_status, physchem, tanimoto, is_parent_row, parseable) -> str:
+    if not parseable:
+        return "not_evaluated: invalid_smiles"
+    if admet_status != "computed":
+        return "not_evaluated: no ADMET predictions"
+    reasons = []
+    if physchem:
+        reasons.append(f"physchem({physchem})")
+    if tanimoto is not None and tanimoto < PARENT_SIMILARITY_MIN:
+        reasons.append(f"parent_tanimoto={tanimoto:.2f}")
+    if reasons:
+        return "outside_proxy_domain: " + " | ".join(reasons)
+    if tanimoto is None and not is_parent_row:
+        return "inside_proxy_domain: physchem only (no parent similarity)"
+    return "inside_proxy_domain"
+
+
+def add_annotations(df: pd.DataFrame, smiles_col: str = "smiles", run_admet: bool = True) -> pd.DataFrame:
+    """Add every annotation column to ``df`` as new columns only.
+
+    Never removes or reorders rows and never mutates the input. When
+    ``run_admet`` is True and ``admet_ai`` is installed, prediction columns
+    are added with the ``admet_`` prefix.
+    """
     if smiles_col not in df.columns:
         raise ValueError(f"add_annotations: '{smiles_col}' column not found in the given DataFrame.")
-    
+
     df = df.copy()
-    annotations = df[smiles_col].apply(annotate_smiles).apply(pd.Series)
-    
+    smiles = df[smiles_col]
+    records = [annotate_smiles(s) for s in smiles]
+    ann = pd.DataFrame.from_records(records, index=df.index, columns=ANNOTATION_COLUMNS)
+    parseable = ann["mol_weight_annot"].notna()
+
+    # -- parent similarity --
+    parents = _resolve_parent_smiles(df, smiles_col)
+    ann["parent_tanimoto"] = [parent_similarity(s, p) for s, p in zip(smiles, parents)]
+
+    # -- ADMET-AI --
+    unique_valid = list(dict.fromkeys(s for s, ok in zip(smiles, parseable) if ok))
+    if not run_admet:
+        status, preds = "skipped: disabled", None
+    elif not _admet_ai_available():
+        status, preds = "skipped: admet_ai not installed", None
+    else:
+        preds = try_admet_ai(unique_valid)
+        status = "computed" if preds is not None else "failed: see log"
+    ann["admet_status"] = [status if ok else "skipped: invalid_smiles" for ok in parseable]
+
+    # -- applicability-domain proxy --
+    is_parent = (df["is_parent"] == True) if "is_parent" in df.columns else pd.Series(False, index=df.index)  # noqa: E712
+    ann["admet_applicability_flag"] = [
+        _applicability_flag(st, pc, tn, ip, ok)
+        for st, pc, tn, ip, ok in zip(
+            ann["admet_status"], ann["physchem_out_of_range"], ann["parent_tanimoto"], is_parent, parseable
+        )
+    ]
+
     for col in ANNOTATION_COLUMNS:
-        df[col] = annotations[col] if col in annotations.columns else None
+        df[col] = ann[col]
 
-    # Determine the parent smiles column for applicability domain check
-    parent_col = "parent_smiles" if "parent_smiles" in df.columns else smiles_col
-
-    # Overwrite the 'not_implemented' stub with the actual AD evaluation
-    df["admet_applicability_flag"] = df.apply(
-        lambda row: check_applicability_domain(
-            metabolite_smiles=row[smiles_col],
-            parent_smiles=row[parent_col] if parent_col in row else row[smiles_col],
-            mol_weight=row.get("mol_weight_annot"),
-            logp=row.get("clogp"),
-            tpsa=row.get("tpsa")
-        ), 
-        axis=1
-    )
+    if preds is not None:
+        for col in preds.columns:
+            out_col = col if str(col).startswith(ADMET_PREFIX) else f"{ADMET_PREFIX}{col}"
+            if out_col in ANNOTATION_COLUMNS:
+                out_col = f"{out_col}_pred"
+            df[out_col] = smiles.map(preds[col])
 
     return df
