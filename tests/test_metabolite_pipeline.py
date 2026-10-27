@@ -57,7 +57,12 @@ def test_full_pipeline_parent_only(tmp_path, fake_gnina):
     assert comparison_df.iloc[0]["target_id"] == "T1"
     # annotation columns present (Phase 6)
     assert "conjugate_flag" in comparison_df.columns
-    assert "reactive_alert" in comparison_df.columns
+    assert "alert_brenk_n" in comparison_df.columns
+    assert "alert_pains_a_n" in comparison_df.columns
+    assert "exposure_plausibility" in comparison_df.columns
+    assert "ad_status" in comparison_df.columns
+    # the collapsed "reactive" boolean was removed on purpose
+    assert "reactive_alert" not in comparison_df.columns
 
     validation_df = pd.read_csv(outputs["validation_redocking"])
     assert len(validation_df) == 1 and validation_df.iloc[0]["target_id"] == "T1"

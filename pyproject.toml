@@ -39,9 +39,15 @@ dev = ["pytest>=7.0"]
 # jar (https://bitbucket.org/wishartlab/biotransformer3.0/), not pip-installable.
 metabolism = ["pyyaml>=6.0", "dimorphite-dl>=1.2.4"]
 # Optional ADMET-AI predictions (Phase 6 annotations); skipped gracefully,
-# with admet_status/admet_applicability_flag columns saying so, if absent.
-# Not verified against a real install in this environment.
+# with admet_status saying so, if absent. Not verified against a real
+# install in this environment.
 annotate = ["admet-ai"]
+# Applicability-domain check for those predictions (Phase 6, ad_* columns).
+# scikit-fingerprints supplies the k-NN domain checker; PyTDC is needed only
+# once, by `gnina-vs fetch-ad-reference`, to assemble the reference set from
+# ADMET-AI's TDC training data. Without them the ad_* columns stay empty with
+# the reason in ad_status. The TDC download path is unverified -- see README.
+applicability = ["scikit-fingerprints>=1.10", "PyTDC"]
 # Phase 7 figures (metabolic tree, bar chart, heatmap, MW scatter).
 figures = ["matplotlib>=3.5"]
 

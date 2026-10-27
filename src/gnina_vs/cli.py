@@ -193,6 +193,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     meta_p.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging.")
     meta_p.set_defaults(func=metabolite_run_command)
 
+    # -- fetch-ad-reference ------------------------------------------------- #
+    ad_p = subparsers.add_parser(
+        "fetch-ad-reference",
+        help="Download and cache the ADMET applicability-domain reference set "
+             "(one-off; needs network and the optional PyTDC package).",
+    )
+    ad_p.add_argument("--name", default="tdc_admet",
+                      help="Name of the reference set to build (default: tdc_admet).")
+    ad_p.add_argument("--overwrite", action="store_true",
+                      help="Rebuild even if a cached reference set already exists.")
+    ad_p.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging.")
+    ad_p.set_defaults(func=fetch_ad_reference_command)
+
     return parser
 
 
@@ -442,6 +455,41 @@ def metabolite_run_command(args: argparse.Namespace) -> None:
                 logger.info("  figure %s: %s", fig_name, fig_paths)
         else:
             logger.info("  %s: %s", name, path)
+
+
+def fetch_ad_reference_command(args: argparse.Namespace) -> None:
+    """Build and cache the ADMET applicability-domain reference set.
+
+    Separated from the pipeline on purpose: this is the only step that
+    reaches the network, so a screening run never does. Run it once per
+    machine, then check the reported molecule count before trusting the
+    ``ad_*`` columns -- the download path has not been exercised against a
+    live TDC endpoint.
+    """
+    from gnina_vs import applicability
+
+    logger.info("=" * 60)
+    logger.info("Building the ADMET applicability-domain reference set")
+    logger.info("=" * 60)
+    logger.info("  Cache directory: %s", applicability.cache_dir())
+
+    path = applicability.build_tdc_reference(name=args.name, overwrite=args.overwrite)
+    if path is None:
+        raise RuntimeError(
+            "Could not build the AD reference set. Install the optional dependency with "
+            "`pip install PyTDC` and check that this machine can reach the TDC data hosts. "
+            "Until a reference set is cached, the ad_* columns stay empty with a reason, "
+            "and no applicability domain is reported."
+        )
+
+    smiles = applicability.load_reference_smiles(name=args.name)
+    n = len(smiles) if smiles else 0
+    logger.info("  Reference set: %d unique SMILES -> '%s'.", n, path)
+    if n < 500:
+        logger.warning(
+            "  Only %d molecules in the reference set. That is far smaller than the TDC "
+            "ADMET collection should be -- check the download before relying on it.", n,
+        )
 
 
 # --------------------------------------------------------------------------- #
