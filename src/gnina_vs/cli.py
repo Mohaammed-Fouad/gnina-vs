@@ -206,6 +206,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ad_p.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging.")
     ad_p.set_defaults(func=fetch_ad_reference_command)
 
+    # -- validate-enrichment ------------------------------------------------ #
+    enr_p = subparsers.add_parser(
+        "validate-enrichment",
+        help="Retrospective validation: does the pipeline enrich known actives "
+             "over decoys on a target where the answer is known?",
+    )
+    enr_p.add_argument("--scores", required=True,
+                       help="CSV/Parquet with one row per compound, holding a score "
+                            "column and a boolean label column.")
+    enr_p.add_argument("--score-col", default="dock_cnn_affinity",
+                       help="Column holding the score (default: dock_cnn_affinity).")
+    enr_p.add_argument("--label-col", default="is_active",
+                       help="Column holding the boolean active/decoy label "
+                            "(default: is_active).")
+    direction = enr_p.add_mutually_exclusive_group(required=True)
+    direction.add_argument("--higher-is-better", dest="higher_is_better", action="store_true",
+                           help="For CNNaffinity and other pKd-like scores.")
+    direction.add_argument("--lower-is-better", dest="higher_is_better", action="store_false",
+                           help="For Vina-style affinities in kcal/mol.")
+    enr_p.add_argument("--bootstrap", type=int, default=2000,
+                       help="Bootstrap resamples for the confidence intervals (default: 2000).")
+    enr_p.add_argument("--permutations", type=int, default=1000,
+                       help="Label permutations for the null (default: 1000).")
+    enr_p.add_argument("--seed", type=int, default=0, help="Random seed (default: 0).")
+    enr_p.add_argument("--out", default=None,
+                       help="Write the full result as JSON to this path.")
+    enr_p.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging.")
+    enr_p.set_defaults(func=validate_enrichment_command)
+
     return parser
 
 
@@ -490,6 +519,61 @@ def fetch_ad_reference_command(args: argparse.Namespace) -> None:
             "  Only %d molecules in the reference set. That is far smaller than the TDC "
             "ADMET collection should be -- check the download before relying on it.", n,
         )
+
+
+def validate_enrichment_command(args: argparse.Namespace) -> None:
+    """Score a labelled active/decoy set and report every metric with its
+    confidence interval.
+
+    The direction flag is required rather than defaulted on purpose: getting
+    it backwards mirrors the result, turning a good ranking into a bad one.
+    """
+    import pandas as pd
+
+    from gnina_vs import enrichment
+
+    path = args.scores
+    df = pd.read_parquet(path) if str(path).endswith(".parquet") else pd.read_csv(path)
+    for col in (args.score_col, args.label_col):
+        if col not in df.columns:
+            raise ValueError(
+                f"'{col}' not found in '{path}'. Available columns: {list(df.columns)}"
+            )
+
+    labels = df[args.label_col]
+    if labels.dtype == object:
+        labels = labels.astype(str).str.lower().isin(["true", "1", "yes", "active"])
+
+    result = enrichment.evaluate(
+        df[args.score_col].to_numpy(dtype=float), labels.to_numpy(dtype=bool),
+        higher_is_better=args.higher_is_better,
+        n_boot=args.bootstrap, n_perm=args.permutations, seed=args.seed,
+    )
+
+    logger.info("=" * 62)
+    logger.info("Retrospective enrichment: %s (%s)", args.score_col,
+                "higher is better" if args.higher_is_better else "lower is better")
+    logger.info("=" * 62)
+    logger.info("  %d compounds: %d actives, %d decoys (%.2f%% active)",
+                result["n_compounds"], result["n_actives"], result["n_decoys"],
+                100 * result["active_fraction"])
+    for key, label in (("roc_auc", "ROC AUC"), ("log_auc_adjusted", "logAUC (adj)"),
+                       ("bedroc", "BEDROC")):
+        v = result[key]
+        logger.info("  %-14s %+.3f   95%% CI [%+.3f, %+.3f]",
+                    label, v["value"], v["ci95_low"], v["ci95_high"])
+    for entry in result["enrichment_factor"].values():
+        logger.info("  EF @ %-8s %6.2f   95%% CI [%.2f, %.2f]   max possible %.1f",
+                    f"{entry['fraction']:.1%}", entry["value"],
+                    entry["ci95_low"], entry["ci95_high"], entry["max_possible"])
+    logger.info("  permutation p (ROC AUC): %.4f", result["permutation_p_roc_auc"])
+    logger.info("")
+    logger.info("  %s", result["interpretation_note"])
+
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump(result, fh, indent=2, default=str)
+        logger.info("  Full result -> '%s'.", args.out)
 
 
 # --------------------------------------------------------------------------- #

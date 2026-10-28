@@ -19,6 +19,7 @@ This is a refactor of a single-file prototype script into a proper package: ever
   - [Annotation & Toxicity-Relevant Flags](#annotation--toxicity-relevant-flags)
 - [Output Tables](#output-tables)
 - [The HTML Triage Report](#the-html-triage-report)
+- [Retrospective Validation](#retrospective-validation)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -685,6 +686,32 @@ Two bugs worth knowing about, because both were silent and neither raised anythi
 **Size.** The DataTables bundle is a fixed ~950 KB; each molecule adds roughly 2-4 KB of SVG. A 60-row report is ~1.1 MB. Pass `with_depictions=False` or lower `max_rows` for something small enough to email, and check the logged size before sending.
 
 **Not included:** no 3D viewer and no interaction diagram. 3Dmol.js can be inlined and a parent-versus-metabolite ProLIF interaction-difference table would be the single most informative artifact available, but the interaction diff depends on a deterministically protonated receptor that the pipeline does not yet guarantee -- phase-II metabolites are typically anionic, so a "lost H-bond, gained salt bridge" result can be an artifact of preparation rather than chemistry. Wiring it up before fixing protonation would produce a confident-looking figure built on an assumption.
+
+---
+
+## Retrospective Validation
+
+Module: `enrichment.py`, CLI: `gnina-vs validate-enrichment`.
+
+Without this, the pipeline emits CNNaffinity deltas, rank bands and ligand efficiencies with nothing establishing that any of it separates actives from decoys. Those numbers are then not *wrong* so much as **uninterpretable** -- there is no evidence about what a good score means on this target. It is also the first thing a reviewer or examiner asks about.
+
+```bash
+gnina-vs validate-enrichment --scores screen_with_labels.parquet \
+    --score-col dock_cnn_affinity --label-col is_active \
+    --higher-is-better --out enrichment.json
+```
+
+The direction flag is **required, not defaulted**: CNNaffinity is pKd-like (higher is better) while Vina affinity is kcal/mol (more negative is better), and getting it backwards mirrors the result, turning a good ranking into a bad one.
+
+**Every metric carries an interval.** ROC AUC, adjusted semi-log AUC, enrichment factor at several fractions, and BEDROC, each with a 95% bootstrap confidence interval (stratified, so the active fraction is held fixed) plus a label-permutation p-value. Nothing is reported as a bare point estimate, because the width of the interval is usually what decides whether a difference means anything. A worked example from the smoke test: EF at 0.5% came out at **15.0 with a 95% interval of [0.0, 20.0]** -- the entire possible range. A point estimate alone would have looked like a strong result.
+
+**Decoy construction decides the answer.** The best-documented case: an apparent optimisation gain of **+1.11 logAUC** on DUD-E decoys became **-0.34** once the decoys were properly charge-matched. A pipeline that looks good against decoys differing from the actives in net charge or molecular weight has measured the property difference, not the binding. `charge_balance_report` exists to catch exactly that before it flatters a result, and `match_decoys` selects property-matched decoys from a pool you supply, recording what it matched on.
+
+**Other honest limits.** EF depends on the active fraction and has a ceiling below `1/fraction` whenever actives outnumber the top slice, so `max_possible` is reported beside every EF. BEDROC's own critics note it can give a misleading sense of early improvement and that it depends on the active fraction, so `alpha` and the active fraction travel with it. Compounds with no score are **dropped, not ranked last**, with the count logged: a failed docking is not a weak binder, and ranking it as one invents data.
+
+**What this module does not do.** It does not ship a decoy library and it does not run docking. You supply actives and decoys, dock them through the normal pipeline, and feed the scored table back in. LIT-PCBA or property-matched decoys on a single target is enough to make the pipeline's numbers interpretable.
+
+**NOT YET RUN AGAINST REAL DOCKING OUTPUT.** Every function is unit tested against synthetic rankings with known answers (perfect, good, random, inverted -- 30 tests), but no run against actual Gnina scores has happened. Treat the first real run as part of the validation rather than a formality.
 
 ---
 
