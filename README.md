@@ -18,6 +18,7 @@ This is a refactor of a single-file prototype script into a proper package: ever
   - [Docking](#docking)
   - [Annotation & Toxicity-Relevant Flags](#annotation--toxicity-relevant-flags)
 - [Output Tables](#output-tables)
+- [The HTML Triage Report](#the-html-triage-report)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -656,6 +657,34 @@ Why split at all: the old flat table repeated every molecular descriptor, alert 
 **The no-drop rule is now architectural rather than conventional.** A compound that fails on target A but succeeds on B gets a `poses` row for A with `qc_status='dock_failed'`, null scores, null `pose_rank` and null `pose_key`, plus normal rows for B -- and exactly one `compounds` row regardless. An unparseable SMILES gets one `compounds` row with `qc_status='smiles_invalid'`, so it stays countable in denominators. Scores are nulled wherever `qc_status != 'ok'`, so a failed job can never show a score. Four uniqueness and referential checks run at write time and raise rather than warn, so a broken schema cannot reach disk. Note that no other pipeline documents a convention for retaining failed dockings as rows (DOCKSTRING drops them, discarding 1.8% of molecules) -- this is a defensible local policy, not an inherited standard.
 
 **Current limitation: the `poses` grain is not yet real.** `reporter._parse_gnina_log` stops at mode 1 by design, so the pipeline carries exactly one pose per compound and every `poses` row has `pose_rank == 1`. The keys and the selection rule are already correct for the multi-pose case, so making it real is a change to score extraction in `reporter.py` and nothing in `tables.py`. That change was deliberately not made blind -- parsing every mode across gnina versions cannot be validated against the fixtures in this repo alone -- and it is a prerequisite for PoseBusters gating, interaction-difference tables and showing more than the top pose.
+
+---
+
+## The HTML Triage Report
+
+`metabolite-run` also writes `triage_report.html`: one self-contained file holding parents and their metabolites with structures, bands, flags and QC status, sortable and searchable, meant both for your own triage and for handing to someone who will only open it.
+
+**Self-contained means measured, not assumed.** The requirement is that it opens by double-clicking, with no server and no network. Most of the obvious ecosystem fails that, which is why `report.py` uses the one combination that does not (measured with mols2grid 2.2.0, itables 2.9.1, bokehmol 0.2.0):
+
+| Option | External requests | Verdict |
+|---|---|---|
+| mols2grid, interactive (default) | 4 | **Not offline.** Pulls RDKit.js from unpkg plus jQuery, bootstrap and list.js. The file opens, but no structure renders and sorting is dead. |
+| mols2grid, `template="static"`, `prerender=True` | 2 | Images baked in and RDKit.js gone, but still needs jQuery and bootstrap -- and "static" means no sorting or filtering. |
+| bokehmol (`hover.rdkit` or `hover.smiles_drawer`) | 2 | **Not offline even with `resources=INLINE`** -- fetches RDKit.js or smiles-drawer from unpkg at runtime. |
+| **itables, `connected=False`, bundle inlined** | **0** | Genuinely offline, with sorting, filtering and pagination. |
+
+So structures are pre-rendered to inline SVG by RDKit here rather than drawn in the browser, which is what removes the RDKit.js dependency. `tests/test_report.py` asserts the finished file references zero external URLs, so a regression fails the suite rather than being discovered by a colleague with no wifi.
+
+Two bugs worth knowing about, because both were silent and neither raised anything:
+
+- **itables defaults to `maxBytes='64KB'` and downsamples past it.** An inline depiction is 6-7 KB, so the cap is crossed at about ten molecules and the table simply drops compounds. That would break this project's one hard rule, so downsampling is disabled (`maxBytes=0`) and size is controlled by `max_rows`, which *reports* what it truncated, on the page.
+- **RDKit writes newlines inside SVG path `d` attributes.** Serialised into the page they become literal `\n`, the browser rejects the path with "Expected path command", and every structure renders blank. `molecule_svg` collapses whitespace before embedding.
+
+**The caveats travel with the table.** A supervisor reads the page, not this README, so the header states on the file itself that docking scores are not affinities, that there are deliberately no error bars (the dominant uncertainty is method bias, not sampling spread, so an error bar would measure re-docking variance while reading as distance to the truth), that the columns are not commensurable, and that nothing has been filtered.
+
+**Size.** The DataTables bundle is a fixed ~950 KB; each molecule adds roughly 2-4 KB of SVG. A 60-row report is ~1.1 MB. Pass `with_depictions=False` or lower `max_rows` for something small enough to email, and check the logged size before sending.
+
+**Not included:** no 3D viewer and no interaction diagram. 3Dmol.js can be inlined and a parent-versus-metabolite ProLIF interaction-difference table would be the single most informative artifact available, but the interaction diff depends on a deterministically protonated receptor that the pipeline does not yet guarantee -- phase-II metabolites are typically anionic, so a "lost H-bond, gained salt bridge" result can be an artifact of preparation rather than chemistry. Wiring it up before fixing protonation would produce a confident-looking figure built on an assumption.
 
 ---
 

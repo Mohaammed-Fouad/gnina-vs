@@ -24,7 +24,7 @@ import pandas as pd
 from rdkit import Chem
 
 from gnina_vs import (__version__, annotate, compare, docking, figures, ligand, metabolism,
-                      pocket, protein, tables, validation)
+                      pocket, protein, report, tables, validation)
 from gnina_vs.config import RunConfig, TargetConfig
 from gnina_vs.reporter import extract_results
 
@@ -295,6 +295,18 @@ def run_metabolite_pipeline(config: RunConfig) -> dict:
     manifest_path = outdir / "run_manifest.json"
     with open(manifest_path, "w") as fh:
         json.dump(manifest, fh, indent=2, default=str)
+
+    # -- Phase 7b: one self-contained HTML triage file (best-effort) --
+    if table_paths:
+        try:
+            outputs_report = report.write_report(
+                split, outdir / "triage_report.html", manifest=manifest,
+            )
+            table_paths["triage_report"] = outputs_report
+        except ImportError as exc:
+            logger.info("  [report] skipped: %s", exc)
+        except Exception as exc:
+            logger.warning("  [report] failed (%s) -- continuing.", exc)
 
     # -- Phase 7: figures (best-effort; a figure failing must never fail the run) --
     figures_dir = outdir / "figures"

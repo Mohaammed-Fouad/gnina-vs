@@ -53,6 +53,11 @@ applicability = ["scikit-fingerprints>=1.10", "PyTDC"]
 # booleans to strings and makes a missing value indistinguishable from an
 # empty one, which is why Parquet is the authoritative copy.
 tables = ["pyarrow>=14"]
+# Phase 7b self-contained HTML triage report. itables is the ONLY option
+# measured at zero external requests (mols2grid's interactive grid pulls
+# RDKit.js and three more from CDNs; bokehmol fetches RDKit.js even with
+# resources=INLINE), which is what lets the file open with no network.
+report = ["itables>=2.6"]
 # Phase 7 figures (metabolic tree, bar chart, heatmap, MW scatter).
 figures = ["matplotlib>=3.5"]
 
